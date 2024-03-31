@@ -6,4 +6,4 @@ do
     then
         echo "$pid $ppid $comm"
     fi
-done <<< $(ps -ef -eo pid,ppid,comm | grep filter | grep -v grep)
+done <<< $(ps -eo pid,ppid,comm | grep filter | grep -v grep)
