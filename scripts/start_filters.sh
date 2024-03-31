@@ -2,7 +2,7 @@
 #
 config_file="$HOME/.config/emergence/filters"
 PWD=$PWD
-SLEEP=2
+SLEEP=5
 
 if [ ! -f "$config_file" ]; then
     echo "File $config_file not found."
