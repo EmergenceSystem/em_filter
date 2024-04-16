@@ -8,8 +8,6 @@ pub const MIN_PORT: u16 = 8081;
 #[allow(dead_code)]
 pub const MAX_PORT: u16 = 9000;
 
-pub const REGISTRY_URL: &str = "http://localhost:8080";
-
 #[derive(Serialize, Deserialize)]
 struct FilterInfo {
     url: String,
@@ -18,7 +16,7 @@ struct FilterInfo {
 #[allow(dead_code)]
 pub async fn register_filter(url: &str) {
     let filter_info = FilterInfo { url: url.to_string() };
-    let register_url = format!("{}/register", REGISTRY_URL);
+    let register_url = format!("{}/register", embryo::get_em_disco_url());
 
     match reqwest::Client::new()
         .post(&register_url)
