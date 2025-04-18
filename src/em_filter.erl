@@ -7,7 +7,7 @@
 %%% - Registering a filter with a discovery service
 %%%
 %%% @author Steve Roques
-%%% @version 0.1.4
+%%% @version 0.1.5
 %%% @end
 %%%-------------------------------------------------------------------
 -module(em_filter).

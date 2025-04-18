@@ -14,5 +14,5 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {em_filter, "0.1.4"}
+    {em_filter, "0.1.5"}
 ]}.
