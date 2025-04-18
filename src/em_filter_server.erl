@@ -30,7 +30,8 @@ init({HandlerModule, Port}) ->
     %% Démarrage de Cowboy avec gestion des erreurs
     case cowboy:start_clear(http_listener, [{port, Port}], #{env => #{dispatch => Dispatch}}) of
         {ok, Ref} ->
-            io:format("Serveur démarré sur le port ~p~n", [Port]),
+            io:format("Filter registrer: http://localhost:~p/query~n", [Port]),
+            em_filter:register_filter(io_lib:format("http://localhost:~p/query", [Port])),
             {ok, #state{
                 handler_module = HandlerModule,
                 port = Port,
