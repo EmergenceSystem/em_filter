@@ -2,48 +2,43 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/3]).
+-export([start_link/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
     handler_module,
-    options,
-    port
+    port,
+    cowboy_ref
 }).
 
-%%====================================================================
-%% API functions
-%%====================================================================
+start_link(HandlerModule, Port) ->
+    {ok, _} = application:ensure_all_started(cowboy),
+    gen_server:start_link({local, HandlerModule}, ?MODULE, {HandlerModule, Port}, []).
 
-start_link(HandlerModule, Port, Options) ->
-    gen_server:start_link({local, HandlerModule}, ?MODULE, {HandlerModule, Port, Options}, []).
-
-%%====================================================================
-%% gen_server callbacks
-%%====================================================================
-
-init({HandlerModule, Port, Options}) ->
+init({HandlerModule, Port}) ->
     process_flag(trap_exit, true),
     
-    {ok, _} = inets:start(httpd, [
-        {port, Port},
-        {server_name, atom_to_list(HandlerModule)},
-        {server_root, "."},
-        {document_root, "."},
-        {modules, [mod_get, HandlerModule]}
+    %% Configuration du routage Cowboy
+    Dispatch = cowboy_router:compile([
+        {'_', [
+            {"/query", HandlerModule, []}
+        ]}
     ]),
     
-    io:format("Filter server started on port ~p with handler ~p~n", [Port, HandlerModule]),
-    io:format("Filter registrer: http://localhost:~p/query~n", [Port]),
-    em_filter:register_filter(io_lib:format("http://localhost:~p/query", [Port])),
-    
-    {ok, #state{
-        handler_module = HandlerModule,
-        options = Options,
-        port = Port
-    }}.
+    %% Démarrage de Cowboy avec gestion des erreurs
+    case cowboy:start_clear(http_listener, [{port, Port}], #{env => #{dispatch => Dispatch}}) of
+        {ok, Ref} ->
+            io:format("Serveur démarré sur le port ~p~n", [Port]),
+            {ok, #state{
+                handler_module = HandlerModule,
+                port = Port,
+                cowboy_ref = Ref
+            }};
+        {error, Reason} ->
+            {stop, {cowboy_start_error, Reason}}
+    end.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -54,8 +49,8 @@ handle_cast(_Msg, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{port = Port}) ->
-    inets:stop(httpd, {port, Port}),
+terminate(_Reason, #state{port = _Port, cowboy_ref = Ref}) ->
+    ok = cowboy:stop_listener(Ref),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
