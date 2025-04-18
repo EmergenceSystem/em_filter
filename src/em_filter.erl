@@ -13,7 +13,7 @@
 -module(em_filter).
 
 %% Public API
--export([find_port/0, register_filter/1, start_filter/3]).
+-export([find_port/0, register_filter/1, start_filter/2]).
 
 -export([
     parse_string/1,
@@ -113,11 +113,11 @@ find_port_in_range(Min, Max) when Min =< Max ->
 find_port_in_range(_, _) ->
     {error, no_ports_available}.
 
--spec start_filter(atom(), module(), list()) -> {ok, pid()} | {error, term()}.
-start_filter(FilterName, HandlerModule, Options) ->
+-spec start_filter(atom(), module()) -> {ok, pid()} | {error, term()}.
+start_filter(FilterName, HandlerModule) ->
     {ok, Port} = find_port(),
     
-    {ok, Pid} = em_filter_sup:start_link(FilterName, HandlerModule, Port, Options),
+    {ok, Pid} = em_filter_sup:start_link(FilterName, HandlerModule, Port),
     
     FilterUrl = "http://localhost:" ++ integer_to_list(Port),
     
@@ -235,23 +235,18 @@ decode_hex_entities(Text) ->
     end.
 
 decode_named_entities(Text) ->
-    try
-        mochiweb_html:decode_entities(Text)
-    catch
-        _:_ ->
-            {ok, Pattern} = re:compile(<<"&([a-zA-Z]+);">>),
-            case re:run(Text, Pattern, [{capture, all, binary}, global]) of
-                {match, Matches} ->
-                    lists:foldl(fun([Full, Name], Acc) ->
-                        Entity = resolve_named_entity(Name),
-                        case Entity of
-                            undefined -> Acc;
-                            _ -> safe_binary_replace(Acc, Full, Entity)
-                        end
-                    end, Text, Matches);
-                nomatch ->
-                    Text
-            end
+    {ok, Pattern} = re:compile(<<"&([a-zA-Z]+);">>),
+    case re:run(Text, Pattern, [{capture, all, binary}, global]) of
+        {match, Matches} ->
+            lists:foldl(fun([Full, Name], Acc) ->
+                Entity = resolve_named_entity(Name),
+                case Entity of
+                    undefined -> Acc;
+                    _ -> safe_binary_replace(Acc, Full, Entity)
+                end
+            end, Text, Matches);
+        nomatch ->
+        Text
     end.
 
 resolve_named_entity(<<"nbsp">>) -> <<" ">>;
