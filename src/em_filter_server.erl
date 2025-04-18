@@ -36,6 +36,8 @@ init({HandlerModule, Port, Options}) ->
     ]),
     
     io:format("Filter server started on port ~p with handler ~p~n", [Port, HandlerModule]),
+    io:format("Filter registrer: http://localhost:~p/query~n", [Port]),
+    em_filter:register_filter(io_lib:format("http://localhost:~p/query", [Port])),
     
     {ok, #state{
         handler_module = HandlerModule,
