@@ -7,7 +7,7 @@
 %%% - Registering a filter with a discovery service
 %%%
 %%% @author Steve Roques
-%%% @version 0.1.5
+%%% @version 0.1.6
 %%% @end
 %%%-------------------------------------------------------------------
 -module(em_filter).
@@ -68,7 +68,7 @@ register_filter(FilterUrl) ->
     RegisterUrl = DiscoUrl ++ "/register",
     io:format("Disco URL: ~p~n", [DiscoUrl]),
     io:format("Register URL: ~p~n", [RegisterUrl]),
-    io:format("Filter URL: ~p~n", [FilterUrl]),
+    io:format("Filter URL: ~p~n", [list_to_binary(FilterUrl)]),
     FilterUrlBinary = list_to_binary(FilterUrl),
     Body = jsone:encode(#{
         url => FilterUrlBinary,
