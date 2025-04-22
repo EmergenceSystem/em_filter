@@ -7,7 +7,7 @@
 %%% - Registering a filter with a discovery service
 %%%
 %%% @author Steve Roques
-%%% @version 0.1.6
+%%% @version 0.1.7
 %%% @end
 %%%-------------------------------------------------------------------
 -module(em_filter).
@@ -28,7 +28,8 @@
     decode_hex_entities/1,
     decode_named_entities/1,
     resolve_named_entity/1,
-    should_skip_link/2
+    should_skip_link/2,
+    get_filter_port/1
 ]).
 
 %% Type specifications
@@ -115,15 +116,23 @@ find_port_in_range(_, _) ->
 
 -spec start_filter(atom(), module()) -> {ok, pid()} | {error, term()}.
 start_filter(FilterName, HandlerModule) ->
-    {ok, Port} = find_port(),
-    
-    {ok, Pid} = em_filter_sup:start_link(FilterName, HandlerModule, Port),
-    
-    FilterUrl = "http://localhost:" ++ integer_to_list(Port),
-    
-    register_filter(FilterUrl),
-    
-    {ok, Pid}.
+     case net_kernel:start(FilterName, shortnames) of
+        {ok, _Pid} ->
+            {ok, Port} = find_port(),
+            persistent_term:put({filter_port, FilterName}, Port),
+            {ok, Pid} = em_filter_sup:start_link(FilterName, HandlerModule, Port),
+            FilterUrl = "http://localhost:" ++ integer_to_list(Port),
+            register_filter(FilterUrl),
+            {ok, Pid};
+         Error -> Error
+    end.
+
+get_filter_port(FilterName) ->
+    case persistent_term:get({filter_port, FilterName}, undefined) of
+        undefined -> {error, not_found};
+        Port -> {ok, Port}
+    end.
+
 
 parse_string(Html) when is_binary(Html) ->
     try
