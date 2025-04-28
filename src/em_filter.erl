@@ -5,16 +5,23 @@
 %%% This module provides functions for:
 %%% - Finding an available port for a filter service
 %%% - Registering a filter with a discovery service
+%%% - Processing HTML content
 %%%
 %%% @author Steve Roques
-%%% @version 0.1.7
 %%% @end
 %%%-------------------------------------------------------------------
 -module(em_filter).
 
 %% Public API
--export([find_port/0, register_filter/1, start_filter/2]).
+-export([
+    start_filter/2,
+    stop_filter/1,
+    find_port/0,
+    register_filter/1,
+    get_filter_port/1
+]).
 
+%% HTML Utility functions
 -export([
     parse_string/1,
     extract_elements/2,
@@ -28,17 +35,73 @@
     decode_hex_entities/1,
     decode_named_entities/1,
     resolve_named_entity/1,
-    should_skip_link/2,
-    get_filter_port/1
+    should_skip_link/2
 ]).
 
 %% Type specifications
 -type port_number() :: 1..65535.
 -type filter_url() :: string().
 
+-define(PORT_RANGE_MIN, 8081).
+-define(PORT_RANGE_MAX, 9000).
+
 %%====================================================================
 %% API Functions
 %%====================================================================
+
+%%--------------------------------------------------------------------
+%% @doc Starts a filter service with the given name and handler module.
+%%
+%% @param FilterName Name of the filter (atom)
+%% @param HandlerModule Module to handle requests (module)
+%% @return {ok, Pid} if startup is successful, or
+%%         {error, Reason} if startup fails
+%% @end
+%%--------------------------------------------------------------------
+-spec start_filter(atom(), module()) -> {ok, pid()} | {error, term()}.
+start_filter(FilterName, HandlerModule) ->
+    % Start distributed Erlang node
+    case net_kernel:start(FilterName, shortnames) of
+        {ok, _} ->
+            % Find available port
+            {ok, Port} = find_port(),
+            % Store port number for access by other processes
+            persistent_term:put({filter_port, FilterName}, Port),
+            
+            % Store handler module for reference
+            persistent_term:put({handler_module, FilterName}, HandlerModule),
+            
+            % Start supervisor with filter name
+            % Generate the supervisor name but use it directly in the call
+            em_filter_sup:start_link(FilterName, HandlerModule, Port)
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Stops a running filter service.
+%%
+%% @param FilterName Name of the filter to stop (atom)
+%% @return ok if stopped successfully, or
+%%         {error, not_running} if filter is not running
+%% @end
+%%--------------------------------------------------------------------
+-spec stop_filter(atom()) -> ok | {error, not_running}.
+stop_filter(FilterName) ->
+    SupName = list_to_atom(atom_to_list(FilterName) ++ "_sup"),
+    
+    case whereis(SupName) of
+        undefined ->
+            {error, not_running};
+        Pid ->
+            % Terminate supervisor and all children
+            exit(Pid, shutdown),
+            
+            % Clean up persistent terms
+            persistent_term:erase({filter_port, FilterName}),
+            persistent_term:erase({handler_module, FilterName}),
+            persistent_term:erase({cowboy_ref, FilterName}),
+            
+            ok
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc Finds an available TCP port for the filter service.
@@ -50,13 +113,13 @@
 %%--------------------------------------------------------------------
 -spec find_port() -> {ok, port_number()} | {error, no_ports_available}.
 find_port() ->
-    find_port_in_range(8081, 9000).
+    find_port_in_range(?PORT_RANGE_MIN, ?PORT_RANGE_MAX).
 
 %%--------------------------------------------------------------------
 %% @doc Registers a filter with the discovery service.
 %%
-%% This function sends an HTTP POST request to the discovery service at
-%% http://localhost:8080/register with the filter information in JSON format.
+%% This function sends an HTTP POST request to the discovery service with
+%% the filter information in JSON format.
 %%
 %% @param FilterUrl URL of the filter service to register
 %% @return {ok, registered} if registration is successful, or
@@ -70,14 +133,17 @@ register_filter(FilterUrl) ->
     io:format("Disco URL: ~p~n", [DiscoUrl]),
     io:format("Register URL: ~p~n", [RegisterUrl]),
     io:format("Filter URL: ~p~n", [list_to_binary(FilterUrl)]),
+    
     FilterUrlBinary = list_to_binary(FilterUrl),
     Body = jsone:encode(#{
         url => FilterUrlBinary,
         name => <<"Emergence Filter">>,
         description => <<"Library simplifies the creation of filters.">>
     }),
+    
     Headers = [{"Content-Type", "application/json"}],
     Options = [{body_format, binary}],
+    
     case httpc:request(post, {RegisterUrl, Headers, "application/json", Body}, [], Options) of
         {ok, {{_, 200, _}, _, _}} ->
             io:format("Successfully registered filter~n"),
@@ -89,6 +155,25 @@ register_filter(FilterUrl) ->
             io:format("Error registering filter: ~p~n", [Reason]),
             {error, Reason}
     end.
+
+%%--------------------------------------------------------------------
+%% @doc Gets the port number for a running filter.
+%%
+%% @param FilterName Name of the filter
+%% @return {ok, Port} if filter is running, or
+%%         {error, not_found} if filter is not running
+%% @end
+%%--------------------------------------------------------------------
+-spec get_filter_port(atom()) -> {ok, port_number()} | {error, not_found}.
+get_filter_port(FilterName) ->
+    case persistent_term:get({filter_port, FilterName}, undefined) of
+        undefined -> {error, not_found};
+        Port -> {ok, Port}
+    end.
+
+%%====================================================================
+%% Internal Functions
+%%====================================================================
 
 %%--------------------------------------------------------------------
 %% @doc Searches for an available port within a specified range.
@@ -110,29 +195,12 @@ find_port_in_range(Min, Max) when Min =< Max ->
         {error, _} ->
             find_port_in_range(Min + 1, Max)
     end;
-
 find_port_in_range(_, _) ->
     {error, no_ports_available}.
 
--spec start_filter(atom(), module()) -> {ok, pid()} | {error, term()}.
-start_filter(FilterName, HandlerModule) ->
-     case net_kernel:start(FilterName, shortnames) of
-        {ok, _Pid} ->
-            {ok, Port} = find_port(),
-            persistent_term:put({filter_port, FilterName}, Port),
-            {ok, Pid} = em_filter_sup:start_link(FilterName, HandlerModule, Port),
-            FilterUrl = "http://localhost:" ++ integer_to_list(Port),
-            register_filter(FilterUrl),
-            {ok, Pid};
-         Error -> Error
-    end.
-
-get_filter_port(FilterName) ->
-    case persistent_term:get({filter_port, FilterName}, undefined) of
-        undefined -> {error, not_found};
-        Port -> {ok, Port}
-    end.
-
+%%====================================================================
+%% HTML Processing Functions
+%%====================================================================
 
 parse_string(Html) when is_binary(Html) ->
     try
@@ -269,3 +337,4 @@ resolve_named_entity(<<"egrave">>) -> <<"è">>;
 resolve_named_entity(<<"agrave">>) -> <<"à">>;
 resolve_named_entity(<<"ccedil">>) -> <<"ç">>;
 resolve_named_entity(_) -> undefined.
+

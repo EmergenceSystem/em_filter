@@ -1,6 +1,6 @@
 {application, em_filter, [
     {description, "Library simplifies the creation of filters."},
-    {vsn, "0.1.7"},
+    {vsn, "0.1.8"},
     {registered, []},
     {applications, [
         kernel,
@@ -11,7 +11,7 @@
         embryo
     ]},
     {env, []},
-    {modules, []},
+    {modules, [em_filter, em_filter_sup, em_filter_server]},
     {licenses, ["Apache-2.0"]},
     {links, [{"GitHub", "https://github.com/EmergenceSystem/em_filter"}]}
 ]}.
