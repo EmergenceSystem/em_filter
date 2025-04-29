@@ -61,7 +61,7 @@ init({FilterName, HandlerModule, Port}) ->
         #{
             id => ServerName,
             start => {em_filter_server, start_link, [FilterName, HandlerModule, Port]},
-            restart => temporary,
+            restart => transient,
             shutdown => 5000,
             type => worker,
             modules => [em_filter_server]
