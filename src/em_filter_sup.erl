@@ -48,22 +48,23 @@ start_link(FilterName, HandlerModule, Port) ->
 %%--------------------------------------------------------------------
 init({FilterName, HandlerModule, Port}) ->
     ServerName = list_to_atom(atom_to_list(FilterName) ++ "_server"),
-    
+
     ChildSpecs = [
         #{
             id => ServerName,
             start => {em_filter_server, start_link, [FilterName, HandlerModule, Port]},
-            restart => permanent,
+            restart => permanent,  % Ensure the server is restarted on failure
             shutdown => 5000,
             type => worker,
             modules => [em_filter_server]
         }
     ],
-    
+
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
         period => 10
     },
-    
+
     {ok, {SupFlags, ChildSpecs}}.
+

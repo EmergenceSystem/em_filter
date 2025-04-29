@@ -54,28 +54,28 @@ start_link(FilterName, HandlerModule, Port) ->
 %% @end
 %%--------------------------------------------------------------------
 init({FilterName, HandlerModule, Port}) ->
-    process_flag(trap_exit, true),
-    
+    process_flag(trap_exit, true),  % Trap exit signals to handle termination
+
     % Start application dependencies
     {ok, _} = application:ensure_all_started(cowboy),
-    
+
     % Setup Cowboy routes
     Dispatch = cowboy_router:compile([
         {'_', [{"/query", HandlerModule, []}]}
     ]),
-    
+
     % Start Cowboy with unique reference name for this filter
     CowboyRef = list_to_atom(atom_to_list(FilterName) ++ "_http"),
     case cowboy:start_clear(CowboyRef, [{port, Port}], #{env => #{dispatch => Dispatch}}) of
         {ok, _} ->
             % Store cowboy reference for later stopping
             persistent_term:put({cowboy_ref, FilterName}, CowboyRef),
-            
+
             % Register the filter with discovery service
             FilterUrl = "http://localhost:" ++ integer_to_list(Port) ++ "/query",
             io:format("Filter started: ~s~n", [FilterUrl]),
             em_filter:register_filter(FilterUrl),
-            
+
             {ok, #state{
                 filter_name = FilterName,
                 handler_module = HandlerModule,
@@ -112,8 +112,8 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %%--------------------------------------------------------------------
-
 %% @private
+
 %% @doc Handles info messages.
 %%
 %% @param Info The info term
@@ -136,14 +136,15 @@ handle_info(_Info, State) ->
 %% @return ok
 %% @end
 %%--------------------------------------------------------------------
-terminate(_Reason, #state{filter_name = FilterName, cowboy_ref = CowboyRef}) ->
-    % Ensure Cowboy is stopped properly
-    io:format("Stopping filter ~p with Cowboy ref ~p~n", [FilterName, CowboyRef]),
-    cowboy:stop_listener(CowboyRef),
-    
-    % Clear persistent term
-    persistent_term:erase({cowboy_ref, FilterName}),
-    
+terminate(Reason, State) ->
+    io:format("Terminating with reason: ~p~n", [Reason]),
+    % Arrêter le listener Cowboy en utilisant la référence stockée dans l'état
+    case State#state.cowboy_ref of
+        undefined -> ok;
+        CowboyRef ->
+            io:format("Stopping Cowboy listener: ~p~n", [CowboyRef]),
+            ok = cowboy:stop_listener(CowboyRef)
+    end,
     ok.
 
 %%--------------------------------------------------------------------
@@ -158,3 +159,4 @@ terminate(_Reason, #state{filter_name = FilterName, cowboy_ref = CowboyRef}) ->
 %%--------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
