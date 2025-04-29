@@ -61,7 +61,7 @@ init({FilterName, HandlerModule, Port}) ->
         #{
             id => ServerName,
             start => {em_filter_server, start_link, [FilterName, HandlerModule, Port]},
-            restart => transient,  % Change to transient or temporary
+            restart => temporary,
             shutdown => 5000,
             type => worker,
             modules => [em_filter_server]
@@ -70,7 +70,7 @@ init({FilterName, HandlerModule, Port}) ->
 
     SupFlags = #{
         strategy => one_for_one,
-        intensity => 1,  % Reduce intensity
+        intensity => 10,
         period => 30    % Increase period
     },
 
