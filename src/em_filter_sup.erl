@@ -1,17 +1,8 @@
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% `em_filter_sup' - Supervisor for Emergence filter services
-%%%
-%%% This module provides supervision for filter server processes.
-%%%
-%%% @author Steve Roques
-%%% @end
-%%%-------------------------------------------------------------------
 -module(em_filter_sup).
 -behaviour(supervisor).
 
 %% API
--export([start_link/3]).
+-export([start_link/3, stop/1]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -34,6 +25,17 @@ start_link(FilterName, HandlerModule, Port) ->
     SupName = list_to_atom(atom_to_list(FilterName) ++ "_sup"),
     supervisor:start_link({local, SupName}, ?MODULE, {FilterName, HandlerModule, Port}).
 
+%%--------------------------------------------------------------------
+%% @doc Stops the supervisor and its children.
+%%
+%% @param SupName Name of the supervisor (atom)
+%% @end
+%%--------------------------------------------------------------------
+stop(SupName) ->
+    supervisor:terminate_child(SupName, all),
+    supervisor:delete_child(SupName, all),
+    supervisor:stop(SupName).
+
 %%====================================================================
 %% Supervisor callbacks
 %%====================================================================
@@ -53,7 +55,7 @@ init({FilterName, HandlerModule, Port}) ->
         #{
             id => ServerName,
             start => {em_filter_server, start_link, [FilterName, HandlerModule, Port]},
-            restart => permanent,  % Ensure the server is restarted on failure
+            restart => transient,  % Change to transient or temporary
             shutdown => 5000,
             type => worker,
             modules => [em_filter_server]
@@ -62,8 +64,8 @@ init({FilterName, HandlerModule, Port}) ->
 
     SupFlags = #{
         strategy => one_for_one,
-        intensity => 5,
-        period => 10
+        intensity => 1,  % Reduce intensity
+        period => 30    % Increase period
     },
 
     {ok, {SupFlags, ChildSpecs}}.

@@ -1,13 +1,3 @@
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% `em_filter_server' - Server process for Emergence filter services
-%%%
-%%% This module provides a gen_server to manage Cowboy HTTP endpoints
-%%% for Emergence filters.
-%%%
-%%% @author Steve Roques
-%%% @end
-%%%-------------------------------------------------------------------
 -module(em_filter_server).
 -behaviour(gen_server).
 
@@ -113,7 +103,6 @@ handle_cast(_Msg, State) ->
 
 %%--------------------------------------------------------------------
 %% @private
-
 %% @doc Handles info messages.
 %%
 %% @param Info The info term
