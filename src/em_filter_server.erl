@@ -47,9 +47,6 @@ start_link(FilterName, HandlerModule, Port) ->
 %% @end
 %%--------------------------------------------------------------------
 init({FilterName, HandlerModule, Port}) ->
-    %% Create ETS table for synchronization if it doesn't exist
-    ets:new(?LOCK_TABLE, [named_table, public, set]),
-
     %% Wait for the lock to be released
     wait_for_lock(FilterName),
 

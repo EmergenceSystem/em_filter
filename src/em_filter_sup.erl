@@ -7,6 +7,9 @@
 %% Supervisor callbacks
 -export([init/1]).
 
+%% ETS table for synchronization
+-define(LOCK_TABLE, 'cowboy_lock').
+
 %%====================================================================
 %% API functions
 %%====================================================================
@@ -49,6 +52,9 @@ stop(SupName) ->
 %% @end
 %%--------------------------------------------------------------------
 init({FilterName, HandlerModule, Port}) ->
+    %% Create ETS table for synchronization if it doesn't exist
+    ets:new(?LOCK_TABLE, [named_table, public, set]),
+
     ServerName = list_to_atom(atom_to_list(FilterName) ++ "_server"),
 
     ChildSpecs = [
