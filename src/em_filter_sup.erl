@@ -68,5 +68,8 @@ init({FilterName, HandlerModule, Port}) ->
         period => 30    % Increase period
     },
 
+    %% Wait for the lock to be released before starting the child
+    em_filter_server:wait_for_lock(FilterName),
+
     {ok, {SupFlags, ChildSpecs}}.
 

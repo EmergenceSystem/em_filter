@@ -65,6 +65,17 @@ init({FilterName, HandlerModule, Port}) ->
 
     % Start Cowboy with unique reference name for this filter
     CowboyRef = list_to_atom(atom_to_list(FilterName) ++ "_http"),
+
+    % Check if Cowboy is already running
+    case cowboy:get_ref(CowboyRef) of
+        {ok, _ExistingRef} ->
+            io:format("Cowboy listener ~p is already running. Stopping it...~n", [CowboyRef]),
+            ok = cowboy:stop_listener(CowboyRef),
+            timer:sleep(500); % Wait for Cowboy to stop
+        error ->
+            ok
+    end,
+
     case cowboy:start_clear(CowboyRef, [{port, Port}], #{env => #{dispatch => Dispatch}}) of
         {ok, _} ->
             % Store cowboy reference for later stopping
@@ -116,7 +127,6 @@ handle_cast(_Msg, State) ->
 %%
 %% @param Info The info term
 %% @param State The current state
-
 %% @return {noreply, NewState}
 %% @end
 %%--------------------------------------------------------------------
@@ -145,7 +155,10 @@ terminate(Reason, State) ->
             ok = cowboy:stop_listener(CowboyRef),
             persistent_term:delete({cowboy_ref, State#state.filter_name}),
             %% Set the lock to indicate Cowboy is stopping
-            ets:insert(?LOCK_TABLE, {State#state.filter_name, true})
+            ets:insert(?LOCK_TABLE, {State#state.filter_name, true}),
+            %% Release the lock after a short delay to ensure Cowboy has stopped
+            timer:sleep(500),
+            ets:delete(?LOCK_TABLE, State#state.filter_name)
     end,
     ok.
 
