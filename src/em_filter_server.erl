@@ -63,16 +63,7 @@ init({FilterName, HandlerModule, Port}) ->
     % Start Cowboy with unique reference name for this filter
     CowboyRef = list_to_atom(atom_to_list(FilterName) ++ "_http"),
 
-    % Check if Cowboy is already running
-    case cowboy:get_ref(CowboyRef) of
-        {ok, _ExistingRef} ->
-            io:format("Cowboy listener ~p is already running. Stopping it...~n", [CowboyRef]),
-            ok = cowboy:stop_listener(CowboyRef),
-            timer:sleep(500); % Wait for Cowboy to stop
-        error ->
-            ok
-    end,
-
+    % Try to start Cowboy and handle the error if it's already running
     case cowboy:start_clear(CowboyRef, [{port, Port}], #{env => #{dispatch => Dispatch}}) of
         {ok, _} ->
             % Store cowboy reference for later stopping
@@ -89,6 +80,11 @@ init({FilterName, HandlerModule, Port}) ->
                 port = Port,
                 cowboy_ref = CowboyRef
             }};
+        {error, {already_started, _}} ->
+            io:format("Cowboy listener ~p is already running. Stopping it...~n", [CowboyRef]),
+            ok = cowboy:stop_listener(CowboyRef),
+            timer:sleep(500), % Wait for Cowboy to stop
+            init({FilterName, HandlerModule, Port}); % Retry initialization
         {error, Reason} ->
             {stop, {cowboy_start_error, Reason}}
     end.
