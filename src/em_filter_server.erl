@@ -14,6 +14,9 @@
     cowboy_ref :: atom()
 }).
 
+%% ETS table for synchronization
+-define(LOCK_TABLE, 'cowboy_lock').
+
 %%====================================================================
 %% API functions
 %%====================================================================
@@ -44,6 +47,12 @@ start_link(FilterName, HandlerModule, Port) ->
 %% @end
 %%--------------------------------------------------------------------
 init({FilterName, HandlerModule, Port}) ->
+    %% Create ETS table for synchronization if it doesn't exist
+    ets:new(?LOCK_TABLE, [named_table, public, set]),
+
+    %% Wait for the lock to be released
+    wait_for_lock(FilterName),
+
     process_flag(trap_exit, true),  % Trap exit signals to handle termination
 
     % Start application dependencies
@@ -107,6 +116,7 @@ handle_cast(_Msg, State) ->
 %%
 %% @param Info The info term
 %% @param State The current state
+
 %% @return {noreply, NewState}
 %% @end
 %%--------------------------------------------------------------------
@@ -132,7 +142,10 @@ terminate(Reason, State) ->
         undefined -> ok;
         CowboyRef ->
             io:format("Stopping Cowboy listener: ~p~n", [CowboyRef]),
-            ok = cowboy:stop_listener(CowboyRef)
+            ok = cowboy:stop_listener(CowboyRef),
+            persistent_term:delete({cowboy_ref, State#state.filter_name}),
+            %% Set the lock to indicate Cowboy is stopping
+            ets:insert(?LOCK_TABLE, {State#state.filter_name, true})
     end,
     ok.
 
@@ -148,4 +161,20 @@ terminate(Reason, State) ->
 %%--------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Waits for the lock to be released.
+%%
+%% @param FilterName Name of the filter
+%% @end
+%%--------------------------------------------------------------------
+wait_for_lock(FilterName) ->
+    case ets:lookup(?LOCK_TABLE, FilterName) of
+        [] -> ok;
+        _ ->
+            io:format("Waiting for Cowboy to stop...~n"),
+            timer:sleep(100),
+            wait_for_lock(FilterName)
+    end.
 
