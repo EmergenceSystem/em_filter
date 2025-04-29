@@ -139,19 +139,22 @@ handle_info(_Info, State) ->
 %% @end
 %%--------------------------------------------------------------------
 terminate(Reason, State) ->
-    io:format("Terminating with reason: ~p~n", [Reason]),
-    % Arrêter le listener Cowboy en utilisant la référence stockée dans l'état
-    case State#state.cowboy_ref of
-        undefined -> ok;
-        CowboyRef ->
-            io:format("Stopping Cowboy listener: ~p~n", [CowboyRef]),
-            ok = cowboy:stop_listener(CowboyRef),
-            persistent_term:delete({cowboy_ref, State#state.filter_name}),
-            %% Set the lock to indicate Cowboy is stopping
-            ets:insert(?LOCK_TABLE, {State#state.filter_name, true}),
-            %% Release the lock after a short delay to ensure Cowboy has stopped
-            timer:sleep(500),
-            ets:delete(?LOCK_TABLE, State#state.filter_name)
+    case Reason of
+        kill ->
+            io:format("Terminating with reason: ~p~n", [Reason]),
+            case State#state.cowboy_ref of
+                undefined -> ok;
+                CowboyRef ->
+                io:format("Stopping Cowboy listener: ~p~n", [CowboyRef]),
+                ok = cowboy:stop_listener(CowboyRef),
+                persistent_term:delete({cowboy_ref, State#state.filter_name}),
+                %% Set the lock to indicate Cowboy is stopping
+                ets:insert(?LOCK_TABLE, {State#state.filter_name, true}),
+                %% Release the lock after a short delay to ensure Cowboy has stopped
+                timer:sleep(500),
+                ets:delete(?LOCK_TABLE, State#state.filter_name)
+            end;
+        _ -> ok
     end,
     ok.
 
