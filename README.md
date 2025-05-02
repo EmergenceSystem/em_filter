@@ -18,5 +18,5 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {em_filter, "0.1.6"}
+    {em_filter, "0.2.0"}
 ]}.

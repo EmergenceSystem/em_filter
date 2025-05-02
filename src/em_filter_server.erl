@@ -64,7 +64,7 @@ init({FilterName, HandlerModule, Port}) ->
     CowboyRef = list_to_atom(atom_to_list(FilterName) ++ "_http"),
 
     % Try to start Cowboy and handle the error if it's already running
-    case cowboy:start_clear(CowboyRef, [{port, Port}], #{env => #{dispatch => Dispatch}}) of
+    case cowboy:start_clear(CowboyRef, [{ip, {0,0,0,0}},{port, Port}], #{env => #{dispatch => Dispatch}}) of
         {ok, _} ->
             % Store cowboy reference for later stopping
             persistent_term:put({cowboy_ref, FilterName}, CowboyRef),
