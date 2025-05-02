@@ -70,7 +70,7 @@ init({FilterName, HandlerModule, Port}) ->
             persistent_term:put({cowboy_ref, FilterName}, CowboyRef),
 
             % Register the filter with discovery service
-            FilterUrl = "http://localhost:" ++ integer_to_list(Port) ++ "/query",
+            FilterUrl = get_filter_url(Port) ++ "/query",
             io:format("Filter started: ~s~n", [FilterUrl]),
             em_filter:register_filter(FilterUrl),
 
@@ -88,6 +88,21 @@ init({FilterName, HandlerModule, Port}) ->
         {error, Reason} ->
             {stop, {cowboy_start_error, Reason}}
     end.
+
+-spec get_url_from_config(map() | undefined) -> string().
+get_url_from_config(undefined) -> "http://localhost";
+get_url_from_config(ConfigMap) ->
+    case maps:get("em_disco", ConfigMap, undefined) of
+        undefined -> "http://localhost";
+        EmDisco ->
+            maps:get("filter_url", EmDisco, "http://localhost")
+    end.
+
+-spec get_filter_url(integer()) -> string().
+get_filter_url(Port) ->
+    ConfigMap = embryo:read_emergence_conf(),
+    BaseUrl = get_url_from_config(ConfigMap),
+    BaseUrl ++ ":" ++ integer_to_list(Port).
 
 %%--------------------------------------------------------------------
 %% @private
