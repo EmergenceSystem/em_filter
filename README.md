@@ -1,5 +1,9 @@
 # em_filter
 
+[![Hex.pm](https://img.shields.io/hexpm/v/em_filter.svg)](https://hex.pm/packages/em_filter)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/em_filter)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE.md)
+
 An Erlang library for registering Emergence filters with a discovery service.
 
 ## Features
