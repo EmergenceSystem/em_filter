@@ -1,6 +1,6 @@
 {application, em_filter, [
     {description, "Library simplifies the creation of filters."},
-    {vsn, "0.2.0"},
+    {vsn, "0.2.1"},
     {registered, []},
     {applications, [
         kernel,
