@@ -231,55 +231,43 @@ extract_elements(Html, Selector) ->
         ".news_dt" ->
             re:run(Html, "class=['\"]news_dt['\"][^>]*>(.*?)<", [global, dotall, {capture, all, binary}]);
         _ ->
-            % Parser générique pour n'importe quel sélecteur
             parse_generic_selector(Html, Selector)
     end.
 
-%% Fonction helper pour parser les sélecteurs génériques
 parse_generic_selector(Html, Selector) ->
     case parse_selector(Selector) of
         {tag, Tag} ->
-            % Sélecteur simple par tag (ex: "div", "p", "article")
             Pattern = "<" ++ Tag ++ "[^>]*>(.*?)</" ++ Tag ++ ">",
             re:run(Html, Pattern, [global, dotall, {capture, all_but_first, binary}]);
         
         {tag_class, Tag, Class} ->
-            % Sélecteur tag avec classe (ex: "article.post", "div.content")
             Pattern = "<" ++ Tag ++ "[^>]*class=['\"][^'\"]*" ++ Class ++ "[^'\"]*['\"][^>]*>(.*?)</" ++ Tag ++ ">",
             re:run(Html, Pattern, [global, dotall, {capture, all_but_first, binary}]);
         
         {class_only, Class} ->
-            % Sélecteur classe uniquement (ex: ".post", ".content")
             Pattern = "<[^>]*class=['\"][^'\"]*" ++ Class ++ "[^'\"]*['\"][^>]*>(.*?)</[^>]+>",
             re:run(Html, Pattern, [global, dotall, {capture, all_but_first, binary}]);
         
         {id, Id} ->
-            % Sélecteur par ID (ex: "#header", "#content")
             Pattern = "<[^>]*id=['\"]" ++ Id ++ "['\"][^>]*>(.*?)</[^>]+>",
             re:run(Html, Pattern, [global, dotall, {capture, all_but_first, binary}]);
         
         {attribute, Attr, Value} ->
-            % Sélecteur par attribut (ex: "[data-type='news']")
             Pattern = "<[^>]*" ++ Attr ++ "=['\"]" ++ Value ++ "['\"][^>]*>(.*?)</[^>]+>",
             re:run(Html, Pattern, [global, dotall, {capture, all_but_first, binary}]);
         
         error ->
-            % Si le sélecteur n'est pas reconnu, retourner une liste vide
             {match, []}
     end.
 
-%% Parse différents types de sélecteurs CSS
 parse_selector(Selector) ->
     case Selector of
-        % Sélecteur par ID (#id)
         [$# | Id] ->
             {id, Id};
         
-        % Sélecteur par classe (.class)
         [$. | Class] ->
             {class_only, Class};
         
-        % Sélecteur par attribut ([attr=value])
         [$[ | Rest] ->
             case string:split(Rest, "=") of
                 [Attr, ValueWithBracket] ->
@@ -289,7 +277,6 @@ parse_selector(Selector) ->
                 _ -> error
             end;
         
-        % Sélecteur tag.classe
         _ ->
             case string:split(Selector, ".") of
                 [Tag, Class] ->
