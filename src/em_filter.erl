@@ -1,11 +1,12 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% `em_filter' - Library for registering Emergence filters
+%%% `em_filter' - Library for registering Emergence filters with data aggregation
 %%%
 %%% This module provides functions for:
 %%% - Finding an available port for a filter service
 %%% - Registering a filter with a discovery service
-%%% - Processing HTML content
+%%% - Processing HTML content with multiple data types
+%%% - Aggregating different content types (text, links, images, etc.)
 %%%
 %%% @author Steve Roques
 %%% @end
@@ -38,9 +39,30 @@
     should_skip_link/2
 ]).
 
+%% Enhanced data aggregation functions
+-export([
+    extract_content_blocks/1,
+    aggregate_data/2,
+    classify_content/1,
+    extract_images/1,
+    extract_links_with_text/1,
+    extract_text_blocks/1,
+    extract_media_content/1,
+    merge_content_types/1,
+    format_aggregated_data/1
+]).
+
 %% Type specifications
 -type port_number() :: 1..65535.
 -type filter_url() :: string().
+-type content_type() :: text | link | image | video | audio | mixed.
+-type content_block() :: #{
+    type => content_type(),
+    data => term(),
+    metadata => map(),
+    position => integer()
+}.
+-type aggregated_content() :: [content_block()].
 
 -define(PORT_RANGE_MIN, 8081).
 -define(PORT_RANGE_MAX, 9000).
@@ -137,8 +159,8 @@ register_filter(FilterUrl) ->
     FilterUrlBinary = list_to_binary(FilterUrl),
     Body = jsone:encode(#{
         url => FilterUrlBinary,
-        name => <<"Emergence Filter">>,
-        description => <<"Library simplifies the creation of filters.">>
+        name => <<"Emergence Filter Enhanced">>,
+        description => <<"Library with enhanced data aggregation capabilities.">>
     }),
     
     Headers = [{"Content-Type", "application/json"}],
@@ -172,20 +194,364 @@ get_filter_port(FilterName) ->
     end.
 
 %%====================================================================
-%% Internal Functions
+%% Enhanced Data Aggregation Functions
 %%====================================================================
 
 %%--------------------------------------------------------------------
-%% @doc Searches for an available port within a specified range.
+%% @doc Extracts and classifies different content blocks from HTML.
 %%
-%% @private
-%% @param Min Lower bound of the port range
-%% @param Max Upper bound of the port range
-%% @return {ok, Port} if an available port is found, or
-%%         {error, no_ports_available} if no port is available
+%% @param Html HTML content as binary
+%% @return {ok, AggregatedContent} or {error, Reason}
 %% @end
 %%--------------------------------------------------------------------
--spec find_port_in_range(port_number(), port_number()) -> {ok, port_number()} | {error, no_ports_available}.
+-spec extract_content_blocks(binary()) -> {ok, aggregated_content()} | {error, term()}.
+extract_content_blocks(Html) ->
+    try
+        % Extract different types of content
+        TextBlocks = extract_text_blocks(Html),
+        Links = extract_links_with_text(Html),
+        Images = extract_images(Html),
+        MediaContent = extract_media_content(Html),
+        
+        % Aggregate all content types
+        AllContent = TextBlocks ++ Links ++ Images ++ MediaContent,
+        
+        % Sort by position in document
+        SortedContent = lists:sort(fun(#{position := P1}, #{position := P2}) -> P1 =< P2 end, AllContent),
+        
+        {ok, SortedContent}
+    catch
+        _:Reason ->
+            {error, {extraction_failed, Reason}}
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Aggregates data based on specified options.
+%%
+%% @param Html HTML content
+%% @param Options Aggregation options map
+%% @return Aggregated content
+%% @end
+%%--------------------------------------------------------------------
+-spec aggregate_data(binary(), map()) -> aggregated_content().
+aggregate_data(Html, Options) ->
+    IncludeText = maps:get(include_text, Options, true),
+    IncludeLinks = maps:get(include_links, Options, true),
+    IncludeImages = maps:get(include_images, Options, true),
+    IncludeMedia = maps:get(include_media, Options, false),
+    MaxItems = maps:get(max_items, Options, 100),
+    MinTextLength = maps:get(min_text_length, Options, 10),
+    
+    {ok, AllContent} = extract_content_blocks(Html),
+    
+    % Filter based on options
+    FilteredContent = lists:filter(fun(#{type := Type, data := Data}) ->
+        case Type of
+            text when IncludeText ->
+                TextContent = maps:get(content, Data, <<>>),
+                byte_size(TextContent) >= MinTextLength;
+            link when IncludeLinks -> true;
+            image when IncludeImages -> true;
+            _ when IncludeMedia -> lists:member(Type, [video, audio]);
+            _ -> false
+        end
+    end, AllContent),
+    
+    % Limit number of items
+    lists:sublist(FilteredContent, MaxItems).
+
+%%--------------------------------------------------------------------
+%% @doc Classifies content type based on HTML element.
+%%
+%% @param Element HTML element as binary
+%% @return Content type atom
+%% @end
+%%--------------------------------------------------------------------
+-spec classify_content(binary()) -> content_type().
+classify_content(Element) ->
+    ElementLower = string:lowercase(Element),
+    case re:run(ElementLower, "<(\\w+)", [{capture, all_but_first, binary}]) of
+        {match, [Tag]} ->
+            case Tag of
+                <<"img">> -> image;
+                <<"video">> -> video;
+                <<"audio">> -> audio;
+                <<"a">> -> link;
+                <<"p">> -> text;
+                <<"div">> -> text;
+                <<"span">> -> text;
+                <<"h1">> -> text;
+                <<"h2">> -> text;
+                <<"h3">> -> text;
+                <<"h4">> -> text;
+                <<"h5">> -> text;
+                <<"h6">> -> text;
+                _ -> mixed
+            end;
+        _ -> text
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Extracts image elements with metadata.
+%%
+%% @param Html HTML content
+%% @return List of image content blocks
+%% @end
+%%--------------------------------------------------------------------
+-spec extract_images(binary()) -> [content_block()].
+extract_images(Html) ->
+    case re:run(Html, "<img[^>]*>", [global, {capture, all, binary}]) of
+        {match, Matches} ->
+            lists:foldl(fun([ImgTag], {Acc, Pos}) ->
+                case extract_image_data(ImgTag) of
+                    {ok, ImageData} ->
+                        Block = #{
+                            type => image,
+                            data => ImageData,
+                            metadata => #{
+                                tag => ImgTag,
+                                extracted_at => erlang:system_time(second)
+                            },
+                            position => Pos
+                        },
+                        {[Block | Acc], Pos + 1};
+                    error ->
+                        {Acc, Pos + 1}
+                end
+            end, {[], 0}, Matches);
+        nomatch ->
+            []
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Extracts links with associated text.
+%%
+%% @param Html HTML content
+%% @return List of link content blocks
+%% @end
+%%--------------------------------------------------------------------
+-spec extract_links_with_text(binary()) -> [content_block()].
+extract_links_with_text(Html) ->
+    case re:run(Html, "<a[^>]*href=['\"]([^'\"]*)['\"][^>]*>(.*?)</a>", [global, dotall, {capture, all, binary}]) of
+        {match, Matches} ->
+            lists:foldl(fun([FullTag, Href, LinkText], {Acc, Pos}) ->
+                CleanText = clean_link_text(LinkText),
+                case byte_size(CleanText) > 0 of
+                    true ->
+                        LinkData = #{
+                            url => Href,
+                            text => CleanText,
+                            full_tag => FullTag
+                        },
+                        Block = #{
+                            type => link,
+                            data => LinkData,
+                            metadata => #{
+                                text_length => byte_size(CleanText),
+                                extracted_at => erlang:system_time(second)
+                            },
+                            position => Pos
+                        },
+                        {[Block | Acc], Pos + 1};
+                    false ->
+                        {Acc, Pos + 1}
+                end
+            end, {[], 0}, Matches);
+        nomatch ->
+            []
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Extracts text blocks from various HTML elements.
+%%
+%% @param Html HTML content
+%% @return List of text content blocks
+%% @end
+%%--------------------------------------------------------------------
+-spec extract_text_blocks(binary()) -> [content_block()].
+extract_text_blocks(Html) ->
+    % Extract from paragraphs, divs, headings, etc.
+    TextSelectors = [
+        {"<p[^>]*>(.*?)</p>", paragraph},
+        {"<div[^>]*>(.*?)</div>", division},
+        {"<h[1-6][^>]*>(.*?)</h[1-6]>", heading},
+        {"<span[^>]*>(.*?)</span>", span}
+    ],
+    
+    lists:foldl(fun({Pattern, Type}, {Acc, Pos}) ->
+        case re:run(Html, Pattern, [global, dotall, {capture, all_but_first, binary}]) of
+            {match, Matches} ->
+                lists:foldl(fun([TextContent], {InnerAcc, InnerPos}) ->
+                    CleanText = decode_html_entities(get_text(TextContent)),
+                    case byte_size(CleanText) > 5 of % Minimum text length
+                        true ->
+                            TextData = #{
+                                content => CleanText,
+                                element_type => Type,
+                                raw_content => TextContent
+                            },
+                            Block = #{
+                                type => text,
+                                data => TextData,
+                                metadata => #{
+                                    length => byte_size(CleanText),
+                                    element_type => Type,
+                                    extracted_at => erlang:system_time(second)
+                                },
+                                position => InnerPos
+                            },
+                            {[Block | InnerAcc], InnerPos + 1};
+                        false ->
+                            {InnerAcc, InnerPos + 1}
+                    end
+                end, {Acc, Pos}, Matches);
+            nomatch ->
+                {Acc, Pos}
+        end
+    end, {[], 0}, TextSelectors).
+
+%%--------------------------------------------------------------------
+%% @doc Extracts media content (video, audio).
+%%
+%% @param Html HTML content
+%% @return List of media content blocks
+%% @end
+%%--------------------------------------------------------------------
+-spec extract_media_content(binary()) -> [content_block()].
+extract_media_content(Html) ->
+    VideoBlocks = extract_media_by_tag(Html, "video", video),
+    AudioBlocks = extract_media_by_tag(Html, "audio", audio),
+    VideoBlocks ++ AudioBlocks.
+
+%%--------------------------------------------------------------------
+%% @doc Merges different content types into a unified structure.
+%%
+%% @param ContentBlocks List of content blocks
+%% @return Merged content structure
+%% @end
+%%--------------------------------------------------------------------
+-spec merge_content_types([content_block()]) -> map().
+merge_content_types(ContentBlocks) ->
+    GroupedContent = lists:foldl(fun(#{type := Type} = Block, Acc) ->
+        CurrentList = maps:get(Type, Acc, []),
+        maps:put(Type, [Block | CurrentList], Acc)
+    end, #{}, ContentBlocks),
+    
+    % Add summary statistics
+    Stats = #{
+        total_blocks => length(ContentBlocks),
+        text_blocks => length(maps:get(text, GroupedContent, [])),
+        link_blocks => length(maps:get(link, GroupedContent, [])),
+        image_blocks => length(maps:get(image, GroupedContent, [])),
+        media_blocks => length(maps:get(video, GroupedContent, [])) + 
+                       length(maps:get(audio, GroupedContent, []))
+    },
+    
+    #{
+        content => GroupedContent,
+        statistics => Stats,
+        generated_at => erlang:system_time(second)
+    }.
+
+%%--------------------------------------------------------------------
+%% @doc Formats aggregated data for output.
+%%
+%% @param AggregatedData Aggregated content data
+%% @return Formatted output map
+%% @end
+%%--------------------------------------------------------------------
+-spec format_aggregated_data(map()) -> map().
+format_aggregated_data(#{content := Content, statistics := Stats} = Data) ->
+    FormattedContent = maps:map(fun(_Type, Blocks) ->
+        lists:map(fun(#{data := BlockData, metadata := Metadata}) ->
+            #{
+                data => BlockData,
+                metadata => Metadata
+            }
+        end, Blocks)
+    end, Content),
+    
+    #{
+        aggregated_content => FormattedContent,
+        summary => Stats,
+        metadata => #{
+            generated_at => maps:get(generated_at, Data),
+            version => <<"1.0">>
+        }
+    }.
+
+%%====================================================================
+%% Internal Helper Functions
+%%====================================================================
+
+extract_image_data(ImgTag) ->
+    case extract_attribute(ImgTag, "src") of
+        {ok, Src} ->
+            Alt = case extract_attribute(ImgTag, "alt") of
+                {ok, AltText} -> AltText;
+                error -> <<>>
+            end,
+            Title = case extract_attribute(ImgTag, "title") of
+                {ok, TitleText} -> TitleText;
+                error -> <<>>
+            end,
+            {ok, #{
+                src => Src,
+                alt => Alt,
+                title => Title
+            }};
+        error ->
+            error
+    end.
+
+clean_link_text(LinkText) ->
+    CleanText = get_text(LinkText),
+    decode_html_entities(CleanText).
+
+extract_media_by_tag(Html, Tag, Type) ->
+    Pattern = "<" ++ Tag ++ "[^>]*>(.*?)</" ++ Tag ++ ">",
+    case re:run(Html, Pattern, [global, dotall, {capture, all, binary}]) of
+        {match, Matches} ->
+            lists:foldl(fun([FullTag, _Content], {Acc, Pos}) ->
+                case extract_media_attributes(FullTag) of
+                    {ok, MediaData} ->
+                        Block = #{
+                            type => Type,
+                            data => MediaData,
+                            metadata => #{
+                                tag => Tag,
+                                extracted_at => erlang:system_time(second)
+                            },
+                            position => Pos
+                        },
+                        {[Block | Acc], Pos + 1};
+                    error ->
+                        {Acc, Pos + 1}
+                end
+            end, {[], 0}, Matches);
+        nomatch ->
+            []
+    end.
+
+extract_media_attributes(MediaTag) ->
+    Src = case extract_attribute(MediaTag, "src") of
+        {ok, SrcValue} -> SrcValue;
+        error -> <<>>
+    end,
+    Controls = case extract_attribute(MediaTag, "controls") of
+        {ok, _} -> true;
+        error -> false
+    end,
+    case byte_size(Src) > 0 of
+        true ->
+            {ok, #{
+                src => Src,
+                controls => Controls
+            }};
+        false ->
+            error
+    end.
+
 find_port_in_range(Min, Max) when Min =< Max ->
     Port = Min,
     case gen_tcp:listen(Port, []) of
@@ -197,10 +563,6 @@ find_port_in_range(Min, Max) when Min =< Max ->
     end;
 find_port_in_range(_, _) ->
     {error, no_ports_available}.
-
-%%====================================================================
-%% HTML Processing Functions
-%%====================================================================
 
 parse_string(Html) when is_binary(Html) ->
     try
