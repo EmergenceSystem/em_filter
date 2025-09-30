@@ -1,13 +1,16 @@
 -module(em_filter_server).
 -behaviour(gen_server).
 
+-include_lib("wade/include/wade.hrl").
+
 %% API
 -export([start_link/3, wait_for_lock/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(state, {
+%% Use a different record name to avoid conflict with Wade's state record
+-record(filter_state, {
     filter_name :: atom(),
     handler_module :: module(),
     port :: integer(),
@@ -68,7 +71,7 @@ init({FilterName, HandlerModule, Port}) ->
             io:format("Filter started: ~s~n", [FilterUrl]),
             em_filter:register_filter(FilterUrl),
 
-            {ok, #state{
+            {ok, #filter_state{
                 filter_name = FilterName,
                 handler_module = HandlerModule,
                 port = Port,
@@ -85,8 +88,29 @@ init({FilterName, HandlerModule, Port}) ->
 %%--------------------------------------------------------------------
 handle_query(Req, HandlerModule) ->
     try
-        %% Get the request body
-        Body = wade:body(Req, "query", ""),
+        %% Get the raw request body (not a parameter, the whole body)
+        Body = case Req#req.body of
+            BodyList when is_list(BodyList) ->
+                %% If body is parsed as form data, get the raw string
+                case proplists:get_value(body, BodyList) of
+                    undefined ->
+                        %% Try to reconstruct or use first element
+                        case BodyList of
+                            [{_, Val}|_] -> Val;
+                            [] -> "";
+                            Other -> Other
+                        end;
+                    Val -> Val
+                end;
+            BodyBin when is_binary(BodyBin) ->
+                binary_to_list(BodyBin);
+            BodyStr when is_list(BodyStr) ->
+                BodyStr;
+            _ ->
+                ""
+        end,
+        
+        io:format("Extracted body: ~p~n", [Body]),
         
         %% Call the handler module (assuming it has a handle/1 function)
         case erlang:function_exported(HandlerModule, handle, 1) of
@@ -152,7 +176,7 @@ handle_cast(_Msg, State) ->
 %% @return {noreply, NewState}
 %% @end
 %%--------------------------------------------------------------------
-handle_info({'EXIT', Pid, Reason}, #state{wade_pid = Pid} = State) ->
+handle_info({'EXIT', Pid, Reason}, #filter_state{wade_pid = WadePid} = State) when Pid =:= WadePid ->
     io:format("Wade server crashed (~p), cleaning up...~n", [Reason]),
     {stop, {wade_crashed, Reason}, State};
 
@@ -174,24 +198,24 @@ handle_info(_Info, State) ->
 terminate(Reason, State) ->
     io:format("Terminating em_filter_server with reason: ~p~n", [Reason]),
     
-    case State#state.wade_pid of
+    case State#filter_state.wade_pid of
         undefined -> 
             ok;
-        WadePid ->
-            io:format("Stopping Wade server (PID: ~p)~n", [WadePid]),
+        _WadePid ->
+            io:format("Stopping Wade server (PID: ~p)~n", [_WadePid]),
             
             %% Set the lock to indicate Wade is stopping
-            ets:insert(?LOCK_TABLE, {State#state.filter_name, true}),
+            ets:insert(?LOCK_TABLE, {State#filter_state.filter_name, true}),
             
             %% Stop Wade server
             catch wade:stop(),
             
             %% Clean up persistent term
-            persistent_term:erase({wade_pid, State#state.filter_name}),
+            persistent_term:erase({wade_pid, State#filter_state.filter_name}),
             
             %% Release the lock after a short delay to ensure Wade has stopped
             timer:sleep(500),
-            ets:delete(?LOCK_TABLE, State#state.filter_name)
+            ets:delete(?LOCK_TABLE, State#filter_state.filter_name)
     end,
     ok.
 
