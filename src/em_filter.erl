@@ -120,7 +120,7 @@ stop_filter(FilterName) ->
             % Clean up persistent terms
             persistent_term:erase({filter_port, FilterName}),
             persistent_term:erase({handler_module, FilterName}),
-            persistent_term:erase({cowboy_ref, FilterName}),
+            persistent_term:erase({wade_pid, FilterName}),
             
             ok
     end.

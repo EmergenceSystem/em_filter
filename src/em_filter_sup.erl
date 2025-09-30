@@ -8,7 +8,7 @@
 -export([init/1]).
 
 %% ETS table for synchronization
--define(LOCK_TABLE, 'cowboy_lock').
+-define(LOCK_TABLE, 'wade_lock').
 
 %%====================================================================
 %% API functions

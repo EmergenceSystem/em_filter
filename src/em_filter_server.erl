@@ -11,11 +11,11 @@
     filter_name :: atom(),
     handler_module :: module(),
     port :: integer(),
-    cowboy_ref :: atom()
+    wade_pid :: pid() | undefined
 }).
 
 %% ETS table for synchronization
--define(LOCK_TABLE, 'cowboy_lock').
+-define(LOCK_TABLE, 'wade_lock').
 
 %%====================================================================
 %% API functions
@@ -52,24 +52,18 @@ init({FilterName, HandlerModule, Port}) ->
 
     process_flag(trap_exit, true),  % Trap exit signals to handle termination
 
-    % Start application dependencies
-    {ok, _} = application:ensure_all_started(cowboy),
+    %% Start Wade HTTP server
+    case wade:start_link(Port) of
+        {ok, WadePid} ->
+            %% Setup route for the filter
+            wade:route(post, "/query", 
+                fun(Req) -> handle_query(Req, HandlerModule) end, 
+                [], []),
 
-    % Setup Cowboy routes
-    Dispatch = cowboy_router:compile([
-        {'_', [{"/query", HandlerModule, []}]}
-    ]),
+            %% Store Wade PID for later reference
+            persistent_term:put({wade_pid, FilterName}, WadePid),
 
-    % Start Cowboy with unique reference name for this filter
-    CowboyRef = list_to_atom(atom_to_list(FilterName) ++ "_http"),
-
-    % Try to start Cowboy and handle the error if it's already running
-    case cowboy:start_clear(CowboyRef, [{ip, {0,0,0,0}},{port, Port}], #{env => #{dispatch => Dispatch}}) of
-        {ok, _} ->
-            % Store cowboy reference for later stopping
-            persistent_term:put({cowboy_ref, FilterName}, CowboyRef),
-
-            % Register the filter with discovery service
+            %% Register the filter with discovery service
             FilterUrl = get_filter_url(Port) ++ "/query",
             io:format("Filter started: ~s~n", [FilterUrl]),
             em_filter:register_filter(FilterUrl),
@@ -78,15 +72,35 @@ init({FilterName, HandlerModule, Port}) ->
                 filter_name = FilterName,
                 handler_module = HandlerModule,
                 port = Port,
-                cowboy_ref = CowboyRef
+                wade_pid = WadePid
             }};
-        {error, {already_started, _}} ->
-            io:format("Cowboy listener ~p is already running. Stopping it...~n", [CowboyRef]),
-            ok = cowboy:stop_listener(CowboyRef),
-            timer:sleep(500), % Wait for Cowboy to stop
-            init({FilterName, HandlerModule, Port}); % Retry initialization
         {error, Reason} ->
-            {stop, {cowboy_start_error, Reason}}
+            io:format("Failed to start Wade server: ~p~n", [Reason]),
+            {stop, {wade_start_error, Reason}}
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Handle the /query endpoint by delegating to the handler module.
+%%--------------------------------------------------------------------
+handle_query(Req, HandlerModule) ->
+    try
+        %% Get the request body
+        Body = wade:body(Req, "query", ""),
+        
+        %% Call the handler module (assuming it has a handle/1 function)
+        case erlang:function_exported(HandlerModule, handle, 1) of
+            true ->
+                Result = HandlerModule:handle(Body),
+                {200, Result, [{"Content-Type", "application/json"}]};
+            false ->
+                {500, "Handler module does not export handle/1", 
+                 [{"Content-Type", "text/plain"}]}
+        end
+    catch
+        Error:Reason:Stack ->
+            io:format("Error handling query: ~p:~p~n~p~n", [Error, Reason, Stack]),
+            {500, "Internal server error", [{"Content-Type", "text/plain"}]}
     end.
 
 -spec get_url_from_config(map() | undefined) -> string().
@@ -138,6 +152,10 @@ handle_cast(_Msg, State) ->
 %% @return {noreply, NewState}
 %% @end
 %%--------------------------------------------------------------------
+handle_info({'EXIT', Pid, Reason}, #state{wade_pid = Pid} = State) ->
+    io:format("Wade server crashed (~p), cleaning up...~n", [Reason]),
+    {stop, {wade_crashed, Reason}, State};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -145,7 +163,7 @@ handle_info(_Info, State) ->
 %% @private
 %% @doc Handles termination of the server.
 %%
-%% This function ensures that the Cowboy listener is properly stopped
+%% This function ensures that the Wade server is properly stopped
 %% when the server terminates.
 %%
 %% @param Reason Termination reason
@@ -154,22 +172,26 @@ handle_info(_Info, State) ->
 %% @end
 %%--------------------------------------------------------------------
 terminate(Reason, State) ->
-    case Reason of
-        kill ->
-            io:format("Terminating with reason: ~p~n", [Reason]),
-            case State#state.cowboy_ref of
-                undefined -> ok;
-                CowboyRef ->
-                io:format("Stopping Cowboy listener: ~p~n", [CowboyRef]),
-                ok = cowboy:stop_listener(CowboyRef),
-                persistent_term:delete({cowboy_ref, State#state.filter_name}),
-                %% Set the lock to indicate Cowboy is stopping
-                ets:insert(?LOCK_TABLE, {State#state.filter_name, true}),
-                %% Release the lock after a short delay to ensure Cowboy has stopped
-                timer:sleep(500),
-                ets:delete(?LOCK_TABLE, State#state.filter_name)
-            end;
-        _ -> ok
+    io:format("Terminating em_filter_server with reason: ~p~n", [Reason]),
+    
+    case State#state.wade_pid of
+        undefined -> 
+            ok;
+        WadePid ->
+            io:format("Stopping Wade server (PID: ~p)~n", [WadePid]),
+            
+            %% Set the lock to indicate Wade is stopping
+            ets:insert(?LOCK_TABLE, {State#state.filter_name, true}),
+            
+            %% Stop Wade server
+            catch wade:stop(),
+            
+            %% Clean up persistent term
+            persistent_term:erase({wade_pid, State#state.filter_name}),
+            
+            %% Release the lock after a short delay to ensure Wade has stopped
+            timer:sleep(500),
+            ets:delete(?LOCK_TABLE, State#state.filter_name)
     end,
     ok.
 
@@ -197,8 +219,7 @@ wait_for_lock(FilterName) ->
     case ets:lookup(?LOCK_TABLE, FilterName) of
         [] -> ok;
         _ ->
-            io:format("Waiting for Cowboy to stop...~n"),
+            io:format("Waiting for Wade to stop...~n"),
             timer:sleep(100),
             wait_for_lock(FilterName)
     end.
-
