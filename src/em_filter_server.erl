@@ -98,7 +98,9 @@ init({FilterName, HandlerModule, Port}) ->
 %%%
 handle_query(Req, HandlerModule) ->
     try
+        io:format("handle_query: Received request~n"),
         Body = wade:body(Req),
+        io:format("handle_query: Parsed body = ~p~n", [Body]),
         QueryValue = case Body of
             M when is_map(M) ->
                 case maps:get(<<"value">>, M, undefined) of
@@ -108,19 +110,25 @@ handle_query(Req, HandlerModule) ->
             [] -> undefined;
             _ -> Body
         end,
+        io:format("handle_query: Extracted QueryValue = ~p~n", [QueryValue]),
         case QueryValue of
             Val when Val =:= undefined; Val =:= <<>> ->
+                io:format("handle_query: Missing or empty body~n"),
                 RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty body">>}),
                 Req2 = wade:reply(Req, 400, #{"content-type" => "application/json"}, RespBody),
                 {Req2, Req2#req.reply_status};
             _ ->
+                io:format("handle_query: Checking handler module export of handle/1~n"),
                 case erlang:function_exported(HandlerModule, handle, 1) of
                     true ->
+                        io:format("handle_query: Calling handler_module:handle/1~n"),
                         Result = HandlerModule:handle(QueryValue),
+                        io:format("handle_query: Handler returned ~p~n", [Result]),
                         RespBody = Result,
                         Req2 = wade:reply(Req, 200, #{"content-type" => "application/json"}, RespBody),
                         {Req2, Req2#req.reply_status};
                     false ->
+                        io:format("handle_query: Handler module missing handle/1 function~n"),
                         RespBody = jsone:encode(#{<<"error">> => <<"Handler module missing handle/1">>}),
                         Req2 = wade:reply(Req, 500, #{"content-type" => "application/json"}, RespBody),
                         {Req2, Req2#req.reply_status}
@@ -128,7 +136,7 @@ handle_query(Req, HandlerModule) ->
         end
     catch
         Error:Reason ->
-            io:format("Error handling query: ~p:~p~n", [Error, Reason]),
+            io:format("handle_query: Error handling query: ~p:~p~n", [Error, Reason]),
             ResponseBody = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
             Req3 = wade:reply(Req, 500, #{"content-type" => "application/json"}, ResponseBody),
             {Req3, Req3#req.reply_status}
