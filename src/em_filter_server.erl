@@ -1,12 +1,12 @@
 %%% @doc
 %%% This module implements a generic filter server based on the gen_server behaviour.
 %%% It manages starting an HTTP server (using Wade) that listens on a configurable port
-%%% and provides a `/query` endpoint for incoming requests.
+%%% and provides a /query endpoint for incoming requests.
 %%%
 %%% The filter server synchronizes access using an ETS-based lock system to prevent
 %%% multiple instances of the same filter starting concurrently.
 %%%
-%%% Incoming HTTP requests are delegated to a pluggable handler module that must export a `handle/1` function.
+%%% Incoming HTTP requests are delegated to a pluggable handler module that must export a handle/1 function.
 %%% This separation allows different filter logic to be plugged without modifying the server infrastructure.
 %%%
 %%% The module includes robust error handling, detailed logging, and graceful shutdown procedures
@@ -45,7 +45,6 @@
 %%% Starts the filter server process with given name, handler module, and HTTP port.
 %%% Registers the process locally using a derived name to avoid conflicts.
 %%%
-%%% @spec start_link(atom(), module(), integer()) -> {ok, pid()} | {error, term()}
 start_link(FilterName, HandlerModule, Port) ->
     ServerName = list_to_atom(atom_to_list(FilterName) ++ "_server"),
     gen_server:start_link({local, ServerName}, ?MODULE, {FilterName, HandlerModule, Port}, []).
@@ -54,13 +53,12 @@ start_link(FilterName, HandlerModule, Port) ->
 %%% Initializes the server by:
 %%% 1. Waiting for any existing lock on the filter to be released (prevents concurrent starts)
 %%% 2. Starting the Wade HTTP server on the configured port
-%%% 3. Registering an HTTP route `/query` that delegates to local handle_query/2
+%%% 3. Registering an HTTP route /query that delegates to local handle_query/2
 %%% 4. Registering filter service URL to a discovery mechanism
 %%% 5. Setting up internal process state
 %%%
 %%% Returns {ok, State} if successful, otherwise stops the server.
 %%%
-%%% @spec init({atom(), module(), integer()}) -> {ok, #filter_state{}} | {stop, term()}
 init({FilterName, HandlerModule, Port}) ->
     wait_for_lock(FilterName),
 
@@ -98,7 +96,6 @@ init({FilterName, HandlerModule, Port}) ->
 %%% Handles empty bodies explicitly by returning 400 error.
 %%% Catches all exceptions to prevent server crash and returns HTTP 500 with error message.
 %%%
-%%% @spec handle_query(wade:req(), module()) -> {integer(), binary(), list()}
 handle_query(Req, HandlerModule) ->
     try
         %% Extract and parse body appropriately
