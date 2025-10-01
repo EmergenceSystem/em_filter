@@ -110,7 +110,7 @@ handle_query(Req, HandlerModule) ->
         end,
         case QueryValue of
             Val when Val =:= undefined; Val =:= <<>> ->
-                RespBody = jsx:encode(#{<<"error">> => <<"Missing or empty body">>}),
+                RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty body">>}),
                 Req2 = wade:reply(Req, 400, #{"content-type" => "application/json"}, RespBody),
                 {Req2, Req2#req.reply_status};
             _ ->
@@ -121,7 +121,7 @@ handle_query(Req, HandlerModule) ->
                         Req2 = wade:reply(Req, 200, #{"content-type" => "application/json"}, RespBody),
                         {Req2, Req2#req.reply_status};
                     false ->
-                        RespBody = jsx:encode(#{<<"error">> => <<"Handler module missing handle/1">>}),
+                        RespBody = jsone:encode(#{<<"error">> => <<"Handler module missing handle/1">>}),
                         Req2 = wade:reply(Req, 500, #{"content-type" => "application/json"}, RespBody),
                         {Req2, Req2#req.reply_status}
                 end
@@ -129,7 +129,7 @@ handle_query(Req, HandlerModule) ->
     catch
         Error:Reason ->
             io:format("Error handling query: ~p:~p~n", [Error, Reason]),
-            ResponseBody = jsx:encode(#{<<"error">> => <<"Internal server error">>}),
+            ResponseBody = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
             Req3 = wade:reply(Req, 500, #{"content-type" => "application/json"}, ResponseBody),
             {Req3, Req3#req.reply_status}
     end.
