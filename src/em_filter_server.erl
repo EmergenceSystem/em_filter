@@ -98,47 +98,40 @@ init({FilterName, HandlerModule, Port}) ->
 %%%
 handle_query(Req, HandlerModule) ->
     try
-        %% Extract and parse body appropriately
-        Body = case Req#req.body of
-            B when is_binary(B), byte_size(B) > 0 ->
-                case catch jsone:decode(B, [{object_format, map}]) of
-                    {'EXIT', _} -> B; % fallback to raw binary if not JSON
-                    Decoded -> Decoded
+        Body = wade:body(Req),
+        QueryValue = case Body of
+            M when is_map(M) ->
+                case maps:get(<<"value">>, M, undefined) of
+                    undefined -> maps:get(<<"query">>, M, undefined);
+                    V -> V
                 end;
-            M when is_map(M) -> M;
-            L when is_list(L), length(L) > 0 ->
-                try jsone:decode(list_to_binary(L), [{object_format, map}])
-                catch _:_ -> list_to_binary(L)
-                end;
-            _ -> undefined
+            [] -> undefined;
+            _ -> Body
         end,
-        %% Validate extracted body presence
-        case Body of
-            undefined ->
-                {400, jsx:encode(#{<<"error">> => <<"Missing or empty body">>}), [
-                    {"Content-Type", "application/json"},
-                    {"Connection", "close"}
-                ]};
+        case QueryValue of
+            Val when Val =:= undefined; Val =:= <<>> ->
+                RespBody = jsx:encode(#{<<"error">> => <<"Missing or empty body">>}),
+                Req2 = wade:reply(Req, 400, #{"content-type" => "application/json"}, RespBody),
+                {Req2, Req2#req.reply_status};
             _ ->
-                %% Check that handler module exports handle/1 function
                 case erlang:function_exported(HandlerModule, handle, 1) of
                     true ->
-                        %% Run handler and return successful response
-                        Result = HandlerModule:handle(Body),
-                        {200, Result, [{"Content-Type", "application/json"}]};
+                        Result = HandlerModule:handle(QueryValue),
+                        RespBody = Result,
+                        Req2 = wade:reply(Req, 200, #{"content-type" => "application/json"}, RespBody),
+                        {Req2, Req2#req.reply_status};
                     false ->
-                        {500, jsx:encode(#{<<"error">> => <<"Handler module missing handle/1">>}), [
-                            {"Content-Type", "application/json"}
-                        ]}
+                        RespBody = jsx:encode(#{<<"error">> => <<"Handler module missing handle/1">>}),
+                        Req2 = wade:reply(Req, 500, #{"content-type" => "application/json"}, RespBody),
+                        {Req2, Req2#req.reply_status}
                 end
         end
     catch
-        Error:Reason:Stack ->
-            io:format("Error handling query: ~p:~p~nStack: ~p~n", [Error, Reason, Stack]),
-            {500, jsx:encode(#{<<"error">> => <<"Internal server error">>}), [
-                {"Content-Type", "application/json"},
-                {"Connection", "close"}
-            ]}
+        Error:Reason ->
+            io:format("Error handling query: ~p:~p~n", [Error, Reason]),
+            ResponseBody = jsx:encode(#{<<"error">> => <<"Internal server error">>}),
+            Req3 = wade:reply(Req, 500, #{"content-type" => "application/json"}, ResponseBody),
+            {Req3, Req3#req.reply_status}
     end.
 
 %%% @private
