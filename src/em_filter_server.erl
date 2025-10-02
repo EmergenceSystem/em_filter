@@ -151,38 +151,52 @@ handle_query(Req, HandlerModule) ->
 %%% Internal Helpers
 %%%===================================================================
 
+%%%===================================================================
+%%% Internal Helpers
+%%%===================================================================
+
 parse_body(Body) when is_map(Body) ->
-    %% Map body: convert all values to binaries if they are lists
+    %% Map body: convert all values to binaries if they are lists or binaries, and keys to binaries
     maps:map(
-        fun(_K, V) ->
-            case V of
-                B when is_list(B) -> list_to_binary(B);
-                B when is_binary(B) -> B;
-                X -> X
-            end
+        fun(K, V) ->
+            {to_binary(K), to_binary(V)}
         end,
         Body
     );
+
 parse_body(L) when is_list(L) ->
     %% Proplist (form-urlencoded) or JSON string
     case L of
         [] -> #{};
         [{K,_V}|_] when is_atom(K) orelse is_binary(K) ->
-            %% Proplist -> map
-            maps:from_list([{to_binary(K), to_binary(V)} || {_K,V} <- L]);
+            %% Proplist -> map with binary keys and values
+            maps:from_list([{to_binary(K1), to_binary(V1)} || {K1, V1} <- L]);
         _ ->
             %% Attempt JSON decode
             try jsone:decode(list_to_binary(L), [{object_format, map}]) of
                 Map -> Map
             catch _:_ -> #{} end
     end;
+
 parse_body(B) when is_binary(B) ->
     %% JSON string
     try jsone:decode(B, [{object_format, map}]) of
         Map -> Map
     catch _:_ -> #{} end;
+
 parse_body(_) -> #{}.
 
-to_binary(B) when is_binary(B) -> B;
-to_binary(L) when is_list(L) -> list_to_binary(L).
+%%%===================================================================
+%%% Convert various types to binary
+%%%===================================================================
+to_binary(B) when is_binary(B) -> 
+    B;
+to_binary(L) when is_list(L) -> 
+    list_to_binary(L);
+to_binary(A) when is_atom(A) -> 
+    atom_to_binary(A, utf8);
+to_binary(X) -> 
+    list_to_binary(lists:flatten(io_lib:format("~p", [X]))).
+
+
 
