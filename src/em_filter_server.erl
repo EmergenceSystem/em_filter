@@ -1,17 +1,15 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% Generic filter server using Wade HTTP server.
-%%% Listens on a configurable port and delegates /query requests
-%%% to a pluggable handler module.
-%%% Handles JSON and form-urlencoded bodies robustly.
+%%% Generic Filter Server using Wade HTTP server.
+%%% Handles /query endpoint, parses incoming JSON or form bodies,
+%%% delegates processing to a pluggable handler module.
 %%%-------------------------------------------------------------------
-
 -module(em_filter_server).
 -behaviour(gen_server).
 
 -include_lib("wade/include/wade.hrl").
 
-%% API exports
+%% API
 -export([start_link/3, wait_for_lock/1]).
 
 %% gen_server callbacks
@@ -25,7 +23,7 @@
     wade_pid :: pid() | undefined
 }).
 
-%% ETS lock table name
+%% ETS table for cross-process locks
 -define(LOCK_TABLE, 'wade_lock').
 
 %%%===================================================================
@@ -52,8 +50,9 @@ init({FilterName, HandlerModule, Port}) ->
 
             persistent_term:put({wade_pid, FilterName}, WadePid),
 
-            FilterUrl = build_filter_url(Port) ++ "/query",
-            io:format("Filter started at: ~s~n", [FilterUrl]),
+            FilterUrl = get_filter_url(Port) ++ "/query",
+            io:format("Filter started: ~s~n", [FilterUrl]),
+            em_filter:register_filter(FilterUrl),
 
             {ok, #filter_state{
                 filter_name = FilterName,
@@ -62,7 +61,7 @@ init({FilterName, HandlerModule, Port}) ->
                 wade_pid = WadePid
             }};
         {error, Reason} ->
-            io:format("Failed to start Wade: ~p~n", [Reason]),
+            io:format("Failed to start Wade server: ~p~n", [Reason]),
             {stop, {wade_start_error, Reason}}
     end.
 
@@ -72,16 +71,20 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'EXIT', Pid, Reason}, #filter_state{wade_pid=WadePid}=State) when Pid =:= WadePid ->
-    io:format("Wade server crashed: ~p~n", [Reason]),
+handle_info({'EXIT', Pid, Reason}, #filter_state{wade_pid = WadePid} = State) when Pid =:= WadePid ->
+    io:format("Wade server crashed (~p), cleaning up...~n", [Reason]),
     {stop, {wade_crashed, Reason}, State};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #filter_state{wade_pid=undefined}) -> ok;
-terminate(_Reason, #filter_state{wade_pid=_WadePid, filter_name=FilterName}) ->
+terminate(_Reason, #filter_state{wade_pid = undefined}) ->
+    ok;
+terminate(_Reason, #filter_state{wade_pid = _WadePid, filter_name = FilterName}) ->
+    io:format("Stopping Wade server...~n"),
     catch wade:stop(),
     persistent_term:erase({wade_pid, FilterName}),
+    timer:sleep(500),
     ets:delete(?LOCK_TABLE, FilterName),
     ok.
 
@@ -89,80 +92,97 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%%===================================================================
-%%% Helpers
+%%% Public Helpers
 %%%===================================================================
 
-%% Waits for any existing lock to release
 wait_for_lock(FilterName) ->
     case ets:lookup(?LOCK_TABLE, FilterName) of
         [] -> ok;
         _ ->
-            io:format("Waiting for previous instance to stop...~n"),
+            io:format("Waiting for existing Wade instance to stop...~n"),
             timer:sleep(100),
             wait_for_lock(FilterName)
     end.
 
-%% Build base filter URL
-build_filter_url(Port) ->
-    "http://localhost:" ++ integer_to_list(Port).
+get_filter_url(Port) ->
+    BaseUrl = case embryo:read_emergence_conf() of
+        undefined -> "http://localhost";
+        Map ->
+            case maps:get("em_disco", Map, #{}) of
+                SubMap -> maps:get("filter_url", SubMap, "http://localhost")
+            end
+    end,
+    BaseUrl ++ ":" ++ integer_to_list(Port).
 
-%%===================================================================
-%%% Handle /query requests
+%%%===================================================================
+%%% Core Request Handling
 %%%===================================================================
 
 handle_query(Req, HandlerModule) ->
     io:format("=== [HANDLE_QUERY START] ===~n"),
-    RawBody = Req#req.body,
-    io:format("[HANDLE_QUERY] Raw Body: ~p~n", [RawBody]),
+    Body = Req#req.body,
+    io:format("[HANDLE_QUERY] Raw Body: ~p~n", [Body]),
 
-    %% Parse body into map
-    ParsedBody = parse_body(RawBody),
+    ParsedBody = parse_body(Body),
     io:format("[HANDLE_QUERY] ParsedBody: ~p~n", [ParsedBody]),
 
-    %% Encode as JSON to pass to handler
-    JsonBody = jsone:encode(ParsedBody),
+    QueryValue = maps:get(<<"value">>, ParsedBody, maps:get(<<"query">>, ParsedBody, <<>>)),
+    io:format("[HANDLE_QUERY] Final QueryValue: ~p~n", [QueryValue]),
 
-    %% Call handler
-    try
-        Result = HandlerModule:handle(JsonBody),
-        {200, Result, [
-            {"Content-Type", "application/json"},
-            {"Connection", "close"}
-        ]}
-    catch
-        Error:Reason ->
-            io:format("[HANDLE_QUERY ERROR] ~p:~p~n", [Error, Reason]),
-            ErrBody = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
-            {500, ErrBody, [
-                {"Content-Type", "application/json"},
-                {"Connection", "close"}
-            ]}
+    case QueryValue of
+        <<>> ->
+            RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty query">>}),
+            {400, RespBody, [{"Content-Type", "application/json"},{"Connection","close"}]};
+        _ ->
+            %% Encode map as JSON only once
+            HandlerInput = jsone:encode(ParsedBody),
+            try
+                Result = HandlerModule:handle(HandlerInput),
+                {200, Result, [{"Content-Type", "application/json"},{"Connection","close"}]}
+            catch
+                Error:Reason ->
+                    io:format("[HANDLE_QUERY ERROR] ~p:~p~n", [Error, Reason]),
+                    ErrResp = jsone:encode(#{<<"error">> => <<"Handler failed">>}),
+                    {500, ErrResp, [{"Content-Type", "application/json"},{"Connection","close"}]}
+            end
     end.
 
-%%===================================================================
-%%% Body Parsing
+%%%===================================================================
+%%% Internal Helpers
 %%%===================================================================
 
 parse_body(Body) when is_map(Body) ->
-    %% Already parsed JSON
-    Body;
-
-parse_body(Body) when is_list(Body), length(Body) > 0 ->
-    %% Could be form-urlencoded or raw JSON list
-    case Body of
+    %% Map body: convert all values to binaries if they are lists
+    maps:map(
+        fun(_K, V) ->
+            case V of
+                B when is_list(B) -> list_to_binary(B);
+                B when is_binary(B) -> B;
+                X -> X
+            end
+        end,
+        Body
+    );
+parse_body(L) when is_list(L) ->
+    %% Proplist (form-urlencoded) or JSON string
+    case L of
+        [] -> #{};
         [{K,_V}|_] when is_atom(K) orelse is_binary(K) ->
-            %% form-urlencoded
-            maps:from_list(Body);
+            %% Proplist -> map
+            maps:from_list([{to_binary(K), to_binary(V)} || {_K,V} <- L]);
         _ ->
-            %% raw list, try to parse as JSON
-            catch jsone:decode(list_to_binary(Body), [{object_format, map}])
+            %% Attempt JSON decode
+            try jsone:decode(list_to_binary(L), [{object_format, map}]) of
+                Map -> Map
+            catch _:_ -> #{} end
     end;
+parse_body(B) when is_binary(B) ->
+    %% JSON string
+    try jsone:decode(B, [{object_format, map}]) of
+        Map -> Map
+    catch _:_ -> #{} end;
+parse_body(_) -> #{}.
 
-parse_body(Body) when is_binary(Body) ->
-    %% JSON binary
-    catch jsone:decode(Body, [{object_format, map}]);
-
-parse_body(_) ->
-    %% fallback empty map
-    #{}.
+to_binary(B) when is_binary(B) -> B;
+to_binary(L) when is_list(L) -> list_to_binary(L).
 
