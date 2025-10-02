@@ -119,16 +119,9 @@ get_filter_url(Port) ->
 %%%===================================================================
 
 handle_query(Req, HandlerModule) ->
-    io:format("=== [HANDLE_QUERY START] ===~n"),
     Body = Req#req.body,
-    io:format("[HANDLE_QUERY] Raw Body: ~p~n", [Body]),
-
     ParsedBody = parse_body(Body),
-    io:format("[HANDLE_QUERY] ParsedBody: ~p~n", [ParsedBody]),
-
     QueryValue = maps:get(<<"value">>, ParsedBody, maps:get(<<"query">>, ParsedBody, <<>>)),
-    io:format("[HANDLE_QUERY] Final QueryValue: ~p~n", [QueryValue]),
-
     case QueryValue of
         <<>> ->
             RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty query">>}),
