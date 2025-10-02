@@ -65,9 +65,13 @@ init({FilterName, HandlerModule, Port}) ->
 
     case wade:start_link(Port) of
         {ok, WadePid} ->
-            %% Register route using same pattern as em_disco (3 args)
+            %% Register route - same API as em_disco: wade:route/4
+            io:format("[INIT] Registering /query route~n"),
             wade:route(post, "/query",
-                fun(Req) -> handle_query(Req, HandlerModule) end),
+                fun(Req) -> 
+                    io:format("[ROUTE] Handler called~n"),
+                    handle_query(Req, HandlerModule) 
+                end, []),
 
             persistent_term:put({wade_pid, FilterName}, WadePid),
 
