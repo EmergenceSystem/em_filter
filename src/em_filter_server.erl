@@ -95,35 +95,69 @@ init({FilterName, HandlerModule, Port}) ->
 %%%
 handle_query(Req, HandlerModule) ->
     io:format("~n=== [HANDLE_QUERY START] ===~n"),
+    io:format("[HANDLE_QUERY] Full Req record: ~p~n", [Req]),
+    io:format("[HANDLE_QUERY] Req record fields:~n"),
+    io:format("  method: ~p~n", [Req#req.method]),
+    io:format("  path: ~p~n", [Req#req.path]),
+    io:format("  headers: ~p~n", [Req#req.headers]),
+    io:format("  body: ~p~n", [Req#req.body]),
+    io:format("  params: ~p~n", [Req#req.params]),
+    io:format("  query: ~p~n", [Req#req.query]),
     io:format("[HANDLE_QUERY] HandlerModule: ~p~n", [HandlerModule]),
     
     try
-        %% Extract body from req record (Wade already parses it)
+        %% Get body directly from req record
         Body = Req#req.body,
-        io:format("[HANDLE_QUERY] Body type: ~p, value: ~p~n", [type_of(Body), Body]),
+        io:format("[HANDLE_QUERY] Body extracted: ~p (type: ~p)~n", [Body, type_of(Body)]),
         
-        %% Extract the query value from body (same logic as em_disco_handlers)
-        QueryValue = case Body of
+        %% Parse body if needed
+        ParsedBody = case Body of
             M when is_map(M) ->
-                io:format("[HANDLE_QUERY] Body is map with keys: ~p~n", [maps:keys(M)]),
-                case maps:get(<<"value">>, M, undefined) of
+                io:format("[HANDLE_QUERY] Body is already a map~n"),
+                M;
+            B when is_binary(B) ->
+                io:format("[HANDLE_QUERY] Body is binary, attempting JSON decode~n"),
+                try
+                    Decoded = jsone:decode(B, [{object_format, map}]),
+                    io:format("[HANDLE_QUERY] JSON decoded: ~p~n", [Decoded]),
+                    Decoded
+                catch
+                    DecError:DecReason ->
+                        io:format("[HANDLE_QUERY] JSON decode failed: ~p:~p~n", [DecError, DecReason]),
+                        #{}
+                end;
+            L when is_list(L) ->
+                io:format("[HANDLE_QUERY] Body is list, attempting JSON decode~n"),
+                try
+                    Binary = list_to_binary(L),
+                    Decoded = jsone:decode(Binary, [{object_format, map}]),
+                    io:format("[HANDLE_QUERY] JSON decoded from list: ~p~n", [Decoded]),
+                    Decoded
+                catch
+                    DecError:DecReason ->
+                        io:format("[HANDLE_QUERY] JSON decode from list failed: ~p:~p~n", [DecError, DecReason]),
+                        #{}
+                end;
+            _ ->
+                io:format("[HANDLE_QUERY] Body is unknown type, using empty map~n"),
+                #{}
+        end,
+        
+        %% Extract query value from parsed body
+        QueryValue = case ParsedBody of
+            Map when is_map(Map) ->
+                io:format("[HANDLE_QUERY] ParsedBody is map with keys: ~p~n", [maps:keys(Map)]),
+                case maps:get(<<"value">>, Map, undefined) of
                     undefined -> 
-                        QV = maps:get(<<"query">>, M, <<>>),
+                        QV = maps:get(<<"query">>, Map, <<>>),
                         io:format("[HANDLE_QUERY] Using 'query' key: ~p~n", [QV]),
                         QV;
                     V -> 
                         io:format("[HANDLE_QUERY] Using 'value' key: ~p~n", [V]),
                         V
                 end;
-            B when is_binary(B) -> 
-                io:format("[HANDLE_QUERY] Body is binary: ~p~n", [B]),
-                B;
-            B when is_list(B) -> 
-                BinValue = list_to_binary(B),
-                io:format("[HANDLE_QUERY] Body converted from list to binary: ~p~n", [BinValue]),
-                BinValue;
             _ -> 
-                io:format("[HANDLE_QUERY] Body is other type, using empty binary~n"),
+                io:format("[HANDLE_QUERY] ParsedBody is not a map~n"),
                 <<>>
         end,
         
@@ -132,8 +166,8 @@ handle_query(Req, HandlerModule) ->
         case QueryValue of
             <<>> ->
                 io:format("[HANDLE_QUERY] Empty query value, returning 400~n"),
-                ResponseBody = jsone:encode(#{<<"error">> => <<"Missing or empty body">>}),
-                {400, ResponseBody, [
+                RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty body">>}),
+                {400, RespBody, [
                     {"Content-Type", "application/json"},
                     {"Connection", "close"}
                 ]};
@@ -154,8 +188,8 @@ handle_query(Req, HandlerModule) ->
             io:format("[ERROR] Stacktrace: ~p~n", [Stacktrace]),
             io:format("[ERROR] HandlerModule: ~p~n", [HandlerModule]),
             
-            ResponseBody1 = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
-            {500, ResponseBody1, [
+            ErrRespBody = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
+            {500, ErrRespBody, [
                 {"Content-Type", "application/json"},
                 {"Connection", "close"}
             ]}
