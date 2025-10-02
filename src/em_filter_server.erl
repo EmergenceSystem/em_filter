@@ -99,51 +99,50 @@ init({FilterName, HandlerModule, Port}) ->
 %%%
 handle_query(Req, HandlerModule) ->
     io:format("~n=== [HANDLE_QUERY START] ===~n"),
-    io:format("[HANDLE_QUERY] Full Req record: ~p~n", [Req]),
-    io:format("[HANDLE_QUERY] Req record fields:~n"),
-    io:format("  method: ~p~n", [Req#req.method]),
-    io:format("  path: ~p~n", [Req#req.path]),
-    io:format("  headers: ~p~n", [Req#req.headers]),
-    io:format("  body: ~p~n", [Req#req.body]),
-    io:format("  params: ~p~n", [Req#req.params]),
-    io:format("  query: ~p~n", [Req#req.query]),
+    io:format("[HANDLE_QUERY] Req: ~p~n", [Req]),
     io:format("[HANDLE_QUERY] HandlerModule: ~p~n", [HandlerModule]),
     
     try
-        %% Get body directly from req record
         Body = Req#req.body,
-        io:format("[HANDLE_QUERY] Body extracted: ~p (type: ~p)~n", [Body, type_of(Body)]),
+        io:format("[HANDLE_QUERY] Body from Req: ~p (type: ~p)~n", [Body, type_of(Body)]),
         
-        %% Parse body if needed
+        %% Wade should have already parsed the body in do/1
+        %% For JSON, it should be a map. For form-urlencoded, a proplist
+        %% If it's empty [], Wade didn't read/parse the body properly
+        
         ParsedBody = case Body of
             M when is_map(M) ->
-                io:format("[HANDLE_QUERY] Body is already a map~n"),
+                io:format("[HANDLE_QUERY] Body is already a map (Wade parsed JSON)~n"),
                 M;
-            B when is_binary(B) ->
-                io:format("[HANDLE_QUERY] Body is binary, attempting JSON decode~n"),
-                try
-                    Decoded = jsone:decode(B, [{object_format, map}]),
-                    io:format("[HANDLE_QUERY] JSON decoded: ~p~n", [Decoded]),
-                    Decoded
-                catch
-                    DecError:DecReason ->
-                        io:format("[HANDLE_QUERY] JSON decode failed: ~p:~p~n", [DecError, DecReason]),
-                        #{}
+            L when is_list(L), length(L) > 0 ->
+                %% Check if it's a proplist or just empty list
+                case L of
+                    [{K, _V} | _] when is_atom(K) orelse is_binary(K) ->
+                        io:format("[HANDLE_QUERY] Body is proplist (form-urlencoded)~n"),
+                        maps:from_list(L);
+                    _ ->
+                        io:format("[HANDLE_QUERY] Body is non-empty list but not proplist, trying JSON decode~n"),
+                        try
+                            jsone:decode(list_to_binary(L), [{object_format, map}])
+                        catch
+                            _:_ ->
+                                io:format("[HANDLE_QUERY ERROR] Failed to parse body~n"),
+                                #{}
+                        end
                 end;
-            L when is_list(L) ->
-                io:format("[HANDLE_QUERY] Body is list, attempting JSON decode~n"),
+            [] ->
+                io:format("[HANDLE_QUERY WARNING] Body is empty list - Wade didn't read the body!~n"),
+                io:format("[HANDLE_QUERY] This might be a Wade bug or socket issue~n"),
+                #{};
+            B when is_binary(B) ->
+                io:format("[HANDLE_QUERY] Body is binary, trying JSON decode~n"),
                 try
-                    Binary = list_to_binary(L),
-                    Decoded = jsone:decode(Binary, [{object_format, map}]),
-                    io:format("[HANDLE_QUERY] JSON decoded from list: ~p~n", [Decoded]),
-                    Decoded
+                    jsone:decode(B, [{object_format, map}])
                 catch
-                    DecError:DecReason ->
-                        io:format("[HANDLE_QUERY] JSON decode from list failed: ~p:~p~n", [DecError, DecReason]),
-                        #{}
+                    _:_ -> #{}
                 end;
             _ ->
-                io:format("[HANDLE_QUERY] Body is unknown type, using empty map~n"),
+                io:format("[HANDLE_QUERY] Body is unknown type~n"),
                 #{}
         end,
         
