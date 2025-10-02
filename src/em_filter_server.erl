@@ -73,80 +73,41 @@ init({FilterName, HandlerModule, Port}) ->
 %%%-------------------------------------------------------------------
 handle_query(Req, HandlerModule) ->
     io:format("=== [HANDLE_QUERY START] ===~n"),
-    BodyRaw = Req#req.body,
-    io:format("[HANDLE_QUERY] Raw Body: ~p (type: ~p)~n", [BodyRaw, type_of(BodyRaw)]),
+    Body = Req#req.body,
+    io:format("[HANDLE_QUERY] Raw Body: ~p~n", [Body]),
 
-    %% Parse body into a map
-    ParsedBody = parse_body(BodyRaw),
-    io:format("[HANDLE_QUERY] ParsedBody: ~p~n", [ParsedBody]),
-
-    %% Extract the query value
-    QueryValue = case ParsedBody of
-        Map when is_map(Map) ->
-            case maps:get(value, Map, undefined) of
-                undefined -> maps:get(query, Map, <<>>);
-                V -> V
+    ParsedBody = case Body of
+        M when is_map(M) ->
+            M;
+        L when is_list(L), L =/= [] ->
+            case L of
+                [{_, _} | _] -> maps:from_list(L);
+                _ ->
+                    try jsone:decode(list_to_binary(L), [{object_format, map}]) of
+                        Map -> Map
+                    catch
+                        _:_ -> #{}
+                    end
             end;
-        _ -> <<>>
+        B when is_binary(B) ->
+            try jsone:decode(B, [{object_format, map}]) of
+                Map -> Map
+            catch
+                _:_ -> #{}
+            end;
+        _ -> #{}
     end,
 
-    io:format("[HANDLE_QUERY] Final QueryValue: ~p~n", [QueryValue]),
+    io:format("[HANDLE_QUERY] ParsedBody: ~p~n", [ParsedBody]),
 
-    %% Check if query is empty
-    case QueryValue of
-        <<>> ->
-            RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty 'value' field">>}),
+    case maps:get(value, ParsedBody, undefined) of
+        undefined ->
+            RespBody = jsone:encode(#{error => <<"Missing 'value' field">>}),
             {400, RespBody, [{"Content-Type", "application/json"}]};
-        _ ->
-            try
-                Result = HandlerModule:handle(QueryValue),
-                {200, Result, [{"Content-Type", "application/json"}]}
-            catch
-                Error:Reason ->
-                    io:format("[HANDLE_QUERY ERROR] ~p:~p~n", [Error, Reason]),
-                    RespBody = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
-                    {500, RespBody, [{"Content-Type", "application/json"}]}
-            end
+        _Value ->
+            Result = HandlerModule:handle(ParsedBody),
+            {200, Result, [{"Content-Type", "application/json"}]}
     end.
-
-%%%-------------------------------------------------------------------
-%%% @private Parse request body robustly
-%%% Supports:
-%%% - JSON binary or string
-%%% - form-urlencoded proplist
-%%% - already parsed map
-%%%-------------------------------------------------------------------
-parse_body(Body) when is_map(Body) ->
-    Body;
-parse_body(Body) when is_list(Body), Body =/= [] ->
-    case Body of
-        [{_, _} | _] ->
-            maps:from_list(Body);  %% form-urlencoded proplist
-        _ ->
-            try
-                jsone:decode(list_to_binary(Body), [{object_format, map}])
-            catch _:_ -> #{}
-            end
-    end;
-parse_body(Body) when is_binary(Body) ->
-    try
-        jsone:decode(Body, [{object_format, map}])
-    catch _:_ -> #{}
-    end;
-parse_body(_) -> #{}.
-
-%%%-------------------------------------------------------------------
-%%% @private Determine type of value
-%%%-------------------------------------------------------------------
-type_of(Val) when is_atom(Val) -> atom;
-type_of(Val) when is_binary(Val) -> binary;
-type_of(Val) when is_list(Val) -> list;
-type_of(Val) when is_map(Val) -> map;
-type_of(Val) when is_integer(Val) -> integer;
-type_of(Val) when is_float(Val) -> float;
-type_of(Val) when is_tuple(Val) -> tuple;
-type_of(Val) when is_pid(Val) -> pid;
-type_of(_) -> unknown.
 
 %%%-------------------------------------------------------------------
 %%% @private Wait until any lock for this filter is released
