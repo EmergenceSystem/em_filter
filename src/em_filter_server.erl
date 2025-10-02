@@ -1,13 +1,12 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% Filter server based on gen_server.
-%%% - Starts a Wade HTTP server on a configurable port.
-%%% - Provides a /query endpoint.
-%%% - Ensures only one instance per filter using an ETS lock table.
-%%% - Delegates request processing to a pluggable handler module.
+%%% Generic filter server based on gen_server and Wade HTTP server.
+%%% - Starts Wade on a configurable port.
+%%% - Exposes a /query endpoint.
+%%% - Parses incoming requests (JSON or form-urlencoded).
+%%% - Delegates processing to a pluggable handler module.
 %%%-------------------------------------------------------------------
 -module(em_filter_server).
-
 -behaviour(gen_server).
 
 -include_lib("wade/include/wade.hrl").
@@ -18,7 +17,7 @@
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
-%% State record
+%% State record storing filter info and Wade server PID
 -record(filter_state, {
     filter_name :: atom(),
     handler_module :: module(),
@@ -26,24 +25,18 @@
     wade_pid :: pid() | undefined
 }).
 
-%% ETS table used as lock to prevent multiple filter instances
+%% ETS table used for synchronization
 -define(LOCK_TABLE, 'wade_lock').
 
 %%%-------------------------------------------------------------------
-%%% @doc
-%%% Starts the filter server
+%%% @doc Start the filter server with given name, handler module, and port.
 %%%-------------------------------------------------------------------
 start_link(FilterName, HandlerModule, Port) ->
     ServerName = list_to_atom(atom_to_list(FilterName) ++ "_server"),
     gen_server:start_link({local, ServerName}, ?MODULE, {FilterName, HandlerModule, Port}, []).
 
 %%%-------------------------------------------------------------------
-%%% @doc
-%%% Initializes server:
-%%% - Waits for lock
-%%% - Starts Wade server
-%%% - Registers /query route
-%%% - Registers filter URL
+%%% @doc Initialize the filter server: wait for lock, start Wade, register route.
 %%%-------------------------------------------------------------------
 init({FilterName, HandlerModule, Port}) ->
     wait_for_lock(FilterName),
@@ -51,17 +44,17 @@ init({FilterName, HandlerModule, Port}) ->
 
     case wade:start_link(Port) of
         {ok, WadePid} ->
+            io:format("[INIT] Wade started on port ~p~n", [Port]),
+
             %% Register /query route
             wade:route(post, "/query",
-                fun(Req) -> handle_query(Req, HandlerModule) end, []),
+                fun(Req) ->
+                    handle_query(Req, HandlerModule)
+                end, []),
 
-            %% Store Wade PID
             persistent_term:put({wade_pid, FilterName}, WadePid),
 
-            %% Register filter URL
-            FilterUrl = get_filter_url(Port) ++ "/query",
-            io:format("Filter started: ~s~n", [FilterUrl]),
-            em_filter:register_filter(FilterUrl),
+            io:format("[INIT] Filter server ~p ready~n", [FilterName]),
 
             {ok, #filter_state{
                 filter_name = FilterName,
@@ -70,57 +63,80 @@ init({FilterName, HandlerModule, Port}) ->
                 wade_pid = WadePid
             }};
         {error, Reason} ->
-            io:format("Failed to start Wade server: ~p~n", [Reason]),
+            io:format("Failed to start Wade: ~p~n", [Reason]),
             {stop, {wade_start_error, Reason}}
     end.
 
 %%%-------------------------------------------------------------------
-%%% @doc
-%%% Parses incoming HTTP body robustly and delegates to handler_module:handle/1
-%%% - Supports JSON (binary map) or form-urlencoded (proplist)
-%%% - Always converts body to map before passing to handler
+%%% @doc Handle /query requests, parse body, delegate to handler module.
+%%% Supports JSON and form-urlencoded bodies.
 %%%-------------------------------------------------------------------
 handle_query(Req, HandlerModule) ->
     io:format("=== [HANDLE_QUERY START] ===~n"),
-    Body = Req#req.body,
-    io:format("[HANDLE_QUERY] Raw Body: ~p (type: ~p)~n", [Body, type_of(Body)]),
+    BodyRaw = Req#req.body,
+    io:format("[HANDLE_QUERY] Raw Body: ~p (type: ~p)~n", [BodyRaw, type_of(BodyRaw)]),
 
-    %% Normalize body to map
-    ParsedBody =
-        case Body of
-            M when is_map(M) ->
-                M;  %% JSON already parsed
-            L when is_list(L), length(L) > 0 ->
-                case L of
-                    [{K,_}|_] when is_atom(K) orelse is_binary(K) ->
-                        maps:from_list(L);  %% form-urlencoded
-                    _ ->
-                        %% Try decode JSON string
-                        try jsone:decode(list_to_binary(L), [{object_format, map}])
-                        catch _:_ -> #{} end
-                end;
-            B when is_binary(B) ->
-                try jsone:decode(B, [{object_format, map}])
-                catch _:_ -> #{} end;
-            _ -> #{}
-        end,
-
+    %% Parse body into a map
+    ParsedBody = parse_body(BodyRaw),
     io:format("[HANDLE_QUERY] ParsedBody: ~p~n", [ParsedBody]),
 
-    %% Call handler module with map
-    try
-        Result = HandlerModule:handle(ParsedBody),
-        {200, Result, [{"Content-Type", "application/json"}, {"Connection", "close"}]}
-    catch
-        Error:Reason ->
-            io:format("[HANDLE_QUERY ERROR] ~p:~p~n", [Error, Reason]),
-            ErrRespBody = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
-            {500, ErrRespBody, [{"Content-Type", "application/json"}, {"Connection", "close"}]}
+    %% Extract the query value
+    QueryValue = case ParsedBody of
+        Map when is_map(Map) ->
+            case maps:get(value, Map, undefined) of
+                undefined -> maps:get(query, Map, <<>>);
+                V -> V
+            end;
+        _ -> <<>>
+    end,
+
+    io:format("[HANDLE_QUERY] Final QueryValue: ~p~n", [QueryValue]),
+
+    %% Check if query is empty
+    case QueryValue of
+        <<>> ->
+            RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty 'value' field">>}),
+            {400, RespBody, [{"Content-Type", "application/json"}]};
+        _ ->
+            try
+                Result = HandlerModule:handle(QueryValue),
+                {200, Result, [{"Content-Type", "application/json"}]}
+            catch
+                Error:Reason ->
+                    io:format("[HANDLE_QUERY ERROR] ~p:~p~n", [Error, Reason]),
+                    RespBody = jsone:encode(#{<<"error">> => <<"Internal server error">>}),
+                    {500, RespBody, [{"Content-Type", "application/json"}]}
+            end
     end.
 
 %%%-------------------------------------------------------------------
-%%% @private
-%%% Returns type of a value
+%%% @private Parse request body robustly
+%%% Supports:
+%%% - JSON binary or string
+%%% - form-urlencoded proplist
+%%% - already parsed map
+%%%-------------------------------------------------------------------
+parse_body(Body) when is_map(Body) ->
+    Body;
+parse_body(Body) when is_list(Body), Body =/= [] ->
+    case Body of
+        [{_, _} | _] ->
+            maps:from_list(Body);  %% form-urlencoded proplist
+        _ ->
+            try
+                jsone:decode(list_to_binary(Body), [{object_format, map}])
+            catch _:_ -> #{}
+            end
+    end;
+parse_body(Body) when is_binary(Body) ->
+    try
+        jsone:decode(Body, [{object_format, map}])
+    catch _:_ -> #{}
+    end;
+parse_body(_) -> #{}.
+
+%%%-------------------------------------------------------------------
+%%% @private Determine type of value
 %%%-------------------------------------------------------------------
 type_of(Val) when is_atom(Val) -> atom;
 type_of(Val) when is_binary(Val) -> binary;
@@ -133,73 +149,41 @@ type_of(Val) when is_pid(Val) -> pid;
 type_of(_) -> unknown.
 
 %%%-------------------------------------------------------------------
-%%% @private
-%%% Builds filter URL using port and optional config
-%%%-------------------------------------------------------------------
--spec get_filter_url(integer()) -> string().
-%%%-------------------------------------------------------------------
-%%% @private
-%%% Builds filter URL using port and optional config
-%%%-------------------------------------------------------------------
-get_filter_url(Port) ->
-    BaseUrl =
-        case embryo:read_emergence_conf() of
-            undefined -> "http://localhost";
-            Map ->
-                EmDisco = maps:get("em_disco", Map, #{}),
-                maps:get("filter_url", EmDisco, "http://localhost")
-        end,
-    BaseUrl ++ ":" ++ integer_to_list(Port).
-
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% Handles synchronous gen_server calls
-%%%-------------------------------------------------------------------
-handle_call(_Request, _From, State) -> {reply, ok, State}.
-
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% Handles asynchronous casts
-%%%-------------------------------------------------------------------
-handle_cast(_Msg, State) -> {noreply, State}.
-
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% Handles exit signals from Wade server
-%%%-------------------------------------------------------------------
-handle_info({'EXIT', Pid, Reason}, #filter_state{wade_pid = WadePid} = State) when Pid =:= WadePid ->
-    io:format("Wade server crashed (~p), cleaning up...~n", [Reason]),
-    {stop, {wade_crashed, Reason}, State};
-handle_info(_Info, State) -> {noreply, State}.
-
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% Gracefully terminates the server and Wade process
-%%%-------------------------------------------------------------------
-terminate(Reason, State) ->
-    io:format("Terminating em_filter_server: ~p~n", [Reason]),
-    case State#filter_state.wade_pid of
-        undefined -> ok;
-        WadePid ->
-            io:format("Stopping Wade server (PID: ~p)~n", [WadePid]),
-            catch wade:stop(),
-            persistent_term:erase({wade_pid, State#filter_state.filter_name})
-    end,
-    ok.
-
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% Handles code upgrades
-%%%-------------------------------------------------------------------
-code_change(_OldVsn, State, _Extra) -> {ok, State}.
-
-%%%-------------------------------------------------------------------
-%%% @doc
-%%% Waits for ETS lock to be released
+%%% @private Wait until any lock for this filter is released
 %%%-------------------------------------------------------------------
 wait_for_lock(FilterName) ->
     case ets:lookup(?LOCK_TABLE, FilterName) of
         [] -> ok;
-        _ -> timer:sleep(100), wait_for_lock(FilterName)
+        _ ->
+            io:format("[LOCK] Waiting for other instance to stop...~n"),
+            timer:sleep(100),
+            wait_for_lock(FilterName)
     end.
+
+%%%-------------------------------------------------------------------
+%%% gen_server callbacks (trivial)
+%%%-------------------------------------------------------------------
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info({'EXIT', Pid, Reason}, #filter_state{wade_pid=WadePid}=State) when Pid =:= WadePid ->
+    io:format("[INFO] Wade server crashed (~p), stopping filter~n", [Reason]),
+    {stop, {wade_crashed, Reason}, State};
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, State) ->
+    case State#filter_state.wade_pid of
+        undefined -> ok;
+        WadePid ->
+            catch wade:stop(WadePid),
+            persistent_term:erase({wade_pid, State#filter_state.filter_name}),
+            ok
+    end.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
 
