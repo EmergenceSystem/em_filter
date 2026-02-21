@@ -1,195 +1,203 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% Generic Filter Server using Wade HTTP server.
-%%% Handles /query endpoint, parses incoming JSON or form bodies,
-%%% delegates processing to a pluggable handler module.
+%%% WebSocket Client for em_disco Connectivity
+%%%
+%%% `em_filter_server' is a `gen_server' that manages a single
+%%% persistent WebSocket connection to an `em_disco' discovery
+%%% service instance.
+%%%
+%%% On startup it:
+%%% <ol>
+%%%   <li>Opens a Gun HTTP connection to the configured disco address.</li>
+%%%   <li>Upgrades the connection to WebSocket on the `/ws' path.</li>
+%%%   <li>Sends a `register' frame so that `em_disco' can route
+%%%       incoming queries to this filter.</li>
+%%% </ol>
+%%%
+%%% When a query frame arrives the server invokes
+%%% `HandlerModule:handle/1' and sends the result back to disco
+%%% as a `result' frame.
+%%%
+%%% Connection failures and remote closes are handled by stopping
+%%% the gen_server with a descriptive reason; the supervisor
+%%% (`em_filter_sup') will restart it, effectively re-connecting.
+%%%
+%%% === Configuration ===
+%%%
+%%% The disco address is read from `embryo:read_emergence_conf/0'
+%%% under the `"em_disco"' key:
+%%%
+%%% ```
+%%% {
+%%%   "em_disco": {
+%%%     "host": "my-disco-host",
+%%%     "port": 8080
+%%%   }
+%%% }
+%%% '''
+%%%
+%%% Defaults to `{"localhost", 8080}' when the config is absent.
+%%%
+%%% @author Steve Roques
+%%% @end
 %%%-------------------------------------------------------------------
 -module(em_filter_server).
 -behaviour(gen_server).
 
--include_lib("wade/include/wade.hrl").
+-export([start_link/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2, code_change/3]).
 
-%% API
--export([start_link/3, wait_for_lock/1]).
-
-%% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
-
-%% State record
--record(filter_state, {
-    filter_name :: atom(),
-    handler_module :: module(),
-    port :: integer(),
-    wade_pid :: pid() | undefined
+%% Per-connection state.
+-record(state, {
+    filter_name    :: atom(),     %% Registered name of this filter instance.
+    handler_module :: module(),   %% Module whose handle/1 processes queries.
+    conn_pid       :: pid(),      %% Gun connection process.
+    stream_ref     :: reference() %% Gun WebSocket stream reference.
 }).
 
-%% ETS table for cross-process locks
--define(LOCK_TABLE, 'wade_lock').
+%% Timeout waiting for the Gun connection to reach the `up' state.
+-define(CONNECT_TIMEOUT, 5000).
+%% Timeout waiting for the WebSocket upgrade handshake to complete.
+-define(UPGRADE_TIMEOUT, 5000).
 
-%%%===================================================================
-%%% API
-%%%===================================================================
-
-start_link(FilterName, HandlerModule, Port) ->
+%%--------------------------------------------------------------------
+%% @doc Starts the gen_server and links it to the calling process.
+%%
+%% The process is registered locally under the name
+%% `<FilterName>_server'.
+%%
+%% @param FilterName    Atom identifying this filter; used as the
+%%                      registration key in `em_disco'.
+%% @param HandlerModule Module exporting `handle/1'.
+%% @return `{ok, Pid}' on success, `{error, Reason}' otherwise.
+%% @end
+%%--------------------------------------------------------------------
+-spec start_link(atom(), module()) -> {ok, pid()} | {error, term()}.
+start_link(FilterName, HandlerModule) ->
     ServerName = list_to_atom(atom_to_list(FilterName) ++ "_server"),
-    gen_server:start_link({local, ServerName}, ?MODULE, {FilterName, HandlerModule, Port}, []).
+    gen_server:start_link({local, ServerName}, ?MODULE,
+                          {FilterName, HandlerModule}, []).
 
-%%%===================================================================
-%%% gen_server callbacks
-%%%===================================================================
+%%--------------------------------------------------------------------
+%% gen_server callbacks
+%%--------------------------------------------------------------------
 
-init({FilterName, HandlerModule, Port}) ->
-    wait_for_lock(FilterName),
-    process_flag(trap_exit, true),
-
-    case wade:start_link(Port) of
-        {ok, WadePid} ->
-            %% Register /query route
-            wade:route(post, "/query",
-                fun(Req) -> handle_query(Req, HandlerModule) end, []),
-
-            persistent_term:put({wade_pid, FilterName}, WadePid),
-
-            FilterUrl = get_filter_url(Port) ++ "/query",
-            io:format("Filter started: ~s~n", [FilterUrl]),
-            em_filter:register_filter(FilterUrl),
-
-            {ok, #filter_state{
-                filter_name = FilterName,
-                handler_module = HandlerModule,
-                port = Port,
-                wade_pid = WadePid
-            }};
+%% @private
+init({FilterName, HandlerModule}) ->
+    {Host, Port} = disco_addr(),
+    {ok, ConnPid} = gun:open(Host, Port, #{protocols => [http]}),
+    case gun:await_up(ConnPid, ?CONNECT_TIMEOUT) of
+        {ok, _} ->
+            StreamRef = gun:ws_upgrade(ConnPid, "/ws"),
+            receive
+                {gun_upgrade, ConnPid, StreamRef, [<<"websocket">>], _} ->
+                    Payload = json:encode(#{
+                        <<"action">> => <<"register">>,
+                        <<"name">>   => atom_to_binary(FilterName, utf8)
+                    }),
+                    gun:ws_send(ConnPid, StreamRef, {text, Payload}),
+                    logger:info("[em_filter] ~s registered on disco ~s:~p",
+                                [FilterName, Host, Port]),
+                    {ok, #state{filter_name    = FilterName,
+                                handler_module = HandlerModule,
+                                conn_pid       = ConnPid,
+                                stream_ref     = StreamRef}};
+                {gun_response, ConnPid, _, _, Status, _} ->
+                    gun:close(ConnPid),
+                    {stop, {ws_rejected, Status}};
+                {gun_error, ConnPid, StreamRef, Reason} ->
+                    gun:close(ConnPid),
+                    {stop, {ws_error, Reason}}
+            after ?UPGRADE_TIMEOUT ->
+                gun:close(ConnPid),
+                {stop, ws_timeout}
+            end;
         {error, Reason} ->
-            io:format("Failed to start Wade server: ~p~n", [Reason]),
-            {stop, {wade_start_error, Reason}}
+            gun:close(ConnPid),
+            {stop, {connect_failed, Reason}}
     end.
 
-handle_call(_Request, _From, State) ->
-    {reply, ok, State}.
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info({'EXIT', Pid, Reason}, #filter_state{wade_pid = WadePid} = State) when Pid =:= WadePid ->
-    io:format("Wade server crashed (~p), cleaning up...~n", [Reason]),
-    {stop, {wade_crashed, Reason}, State};
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, #filter_state{wade_pid = undefined}) ->
-    ok;
-terminate(_Reason, #filter_state{wade_pid = _WadePid, filter_name = FilterName}) ->
-    io:format("Stopping Wade server...~n"),
-    catch wade:stop(),
-    persistent_term:erase({wade_pid, FilterName}),
-    timer:sleep(500),
-    ets:delete(?LOCK_TABLE, FilterName),
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%%===================================================================
-%%% Public Helpers
-%%%===================================================================
-
-wait_for_lock(FilterName) ->
-    case ets:lookup(?LOCK_TABLE, FilterName) of
-        [] -> ok;
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Dispatches incoming WebSocket frames from `em_disco'.
+%%
+%% Handles two frame types:
+%% <ul>
+%%%   <li>A `query' action frame — invokes `HandlerModule:handle/1'
+%%%       with the query body and sends the result back as a `result'
+%%%       frame. Handler crashes are caught, logged, and reported
+%%%       to disco as an error payload.</li>
+%%%   <li>A `close' frame — stops the server so the supervisor
+%%%       can restart and re-connect.</li>
+%%% </ul>
+%%% Acknowledgement frames (e.g. `registered') and any other frames
+%%% are silently ignored.
+%% @end
+%%--------------------------------------------------------------------
+handle_info({gun_ws, _C, _S, {text, Data}}, State) ->
+    case json:decode(Data) of
+        #{<<"action">> := <<"query">>,
+          <<"id">>     := Id,
+          <<"body">>   := Body} ->
+            Result = try
+                (State#state.handler_module):handle(Body)
+            catch E:R ->
+                logger:error("[em_filter] ~s handler error ~p:~p",
+                             [State#state.filter_name, E, R]),
+                json:encode(#{<<"error">> => <<"handler_failed">>})
+            end,
+            gun:ws_send(State#state.conn_pid, State#state.stream_ref,
+                {text, json:encode(#{
+                    <<"action">> => <<"result">>,
+                    <<"id">>     => Id,
+                    <<"data">>   => Result
+                })});
+        %% Acknowledgement frames from disco (e.g. registered) — ignore.
         _ ->
-            io:format("Waiting for existing Wade instance to stop...~n"),
-            timer:sleep(100),
-            wait_for_lock(FilterName)
-    end.
-
-get_filter_url(Port) ->
-    BaseUrl = case embryo:read_emergence_conf() of
-        undefined -> "http://localhost";
-        Map ->
-            case maps:get("em_disco", Map, #{}) of
-                SubMap -> maps:get("filter_url", SubMap, "http://localhost")
-            end
+            ok
     end,
-    BaseUrl ++ ":" ++ integer_to_list(Port).
+    {noreply, State};
 
-%%%===================================================================
-%%% Core Request Handling
-%%%===================================================================
+%% @private
+%% disco closed the WebSocket — stop so the supervisor re-connects.
+handle_info({gun_ws, _C, _S, close}, State) ->
+    logger:warning("[em_filter] ~s: WS closed, reconnecting...",
+                   [State#state.filter_name]),
+    {stop, ws_closed, State};
 
-handle_query(Req, HandlerModule) ->
-    Body = Req#req.body,
-    ParsedBody = parse_body(Body),
-    QueryValue = maps:get(<<"value">>, ParsedBody, maps:get(<<"query">>, ParsedBody, <<>>)),
-    case QueryValue of
-        <<>> ->
-            RespBody = jsone:encode(#{<<"error">> => <<"Missing or empty query">>}),
-            {400, RespBody, [{"Content-Type", "application/json"},{"Connection","close"}]};
-        _ ->
-            %% Encode map as JSON only once
-            HandlerInput = jsone:encode(ParsedBody),
-            try
-                Result = HandlerModule:handle(HandlerInput),
-                {200, Result, [{"Content-Type", "application/json"},{"Connection","close"}]}
-            catch
-                Error:Reason ->
-                    io:format("[HANDLE_QUERY ERROR] ~p:~p~n", [Error, Reason]),
-                    ErrResp = jsone:encode(#{<<"error">> => <<"Handler failed">>}),
-                    {500, ErrResp, [{"Content-Type", "application/json"},{"Connection","close"}]}
-            end
+%% @private
+%% Network-level failure — stop so the supervisor re-connects.
+handle_info({gun_down, _C, _P, Reason, _}, State) ->
+    logger:warning("[em_filter] ~s: disco unreachable (~p), reconnecting...",
+                   [State#state.filter_name, Reason]),
+    {stop, {disco_down, Reason}, State};
+
+handle_info(_Info, State) -> {noreply, State}.
+
+handle_call(_Req, _From, State) -> {reply, ok, State}.
+handle_cast(_Msg, State)        -> {noreply, State}.
+
+%% @private
+%% Closes the Gun connection gracefully on shutdown.
+terminate(_Reason, #state{conn_pid = Pid}) ->
+    gun:close(Pid).
+
+code_change(_OldVsn, State, _Extra) -> {ok, State}.
+
+%%--------------------------------------------------------------------
+%% Internal helpers
+%%--------------------------------------------------------------------
+
+%% Returns the {Host, Port} of the em_disco instance to connect to.
+%% Falls back to {"localhost", 8080} when no configuration is found.
+-spec disco_addr() -> {string(), inet:port_number()}.
+disco_addr() ->
+    case embryo:read_emergence_conf() of
+        undefined -> {"localhost", 8080};
+        Map ->
+            Sub  = maps:get("em_disco", Map, #{}),
+            Host = maps:get("host", Sub, "localhost"),
+            Port = maps:get("port", Sub, 8080),
+            {Host, Port}
     end.
-
-%%%===================================================================
-%%% Internal Helpers
-%%%===================================================================
-
-%%%===================================================================
-%%% Internal Helpers
-%%%===================================================================
-
-parse_body(Body) when is_map(Body) ->
-    %% Map body: convert all values to binaries if they are lists or binaries, and keys to binaries
-    maps:map(
-        fun(K, V) ->
-            {to_binary(K), to_binary(V)}
-        end,
-        Body
-    );
-
-parse_body(L) when is_list(L) ->
-    %% Proplist (form-urlencoded) or JSON string
-    case L of
-        [] -> #{};
-        [{K,_V}|_] when is_atom(K) orelse is_binary(K) ->
-            %% Proplist -> map with binary keys and values
-            maps:from_list([{to_binary(K1), to_binary(V1)} || {K1, V1} <- L]);
-        _ ->
-            %% Attempt JSON decode
-            try jsone:decode(list_to_binary(L), [{object_format, map}]) of
-                Map -> Map
-            catch _:_ -> #{} end
-    end;
-
-parse_body(B) when is_binary(B) ->
-    %% JSON string
-    try jsone:decode(B, [{object_format, map}]) of
-        Map -> Map
-    catch _:_ -> #{} end;
-
-parse_body(_) -> #{}.
-
-%%%===================================================================
-%%% Convert various types to binary
-%%%===================================================================
-to_binary(B) when is_binary(B) -> 
-    B;
-to_binary(L) when is_list(L) -> 
-    list_to_binary(L);
-to_binary(A) when is_atom(A) -> 
-    atom_to_binary(A, utf8);
-to_binary(X) -> 
-    list_to_binary(lists:flatten(io_lib:format("~p", [X]))).
-
-
-

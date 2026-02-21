@@ -1,81 +1,85 @@
+%%%-------------------------------------------------------------------
+%%% @doc
+%%% em_filter Top-Level Supervisor
+%%%
+%%% Manages a dynamic pool of `em_filter_server' workers using a
+%%% `simple_one_for_one' strategy.  Each worker represents one named
+%%% filter connected to an `em_disco' instance.
+%%%
+%%% Workers are started on demand via `start_filter/2' and can be
+%%% stopped individually via `stop_filter/1'.  A crashed worker is
+%%% automatically restarted by the supervisor, which causes it to
+%%% reconnect to `em_disco'.
+%%%
+%%% @author Steve Roques
+%%% @end
+%%%-------------------------------------------------------------------
 -module(em_filter_sup).
 -behaviour(supervisor).
 
-%% API
--export([start_link/3, stop/1]).
-
-%% Supervisor callbacks
--export([init/1]).
-
-%% ETS table for synchronization
--define(LOCK_TABLE, 'wade_lock').
-
-%%====================================================================
-%% API functions
-%%====================================================================
+-export([start_link/0, start_filter/2, stop_filter/1, init/1]).
 
 %%--------------------------------------------------------------------
-%% @doc Starts the supervisor with a specific filter name, handler module,
-%% and port.
+%% @doc Starts the supervisor and registers it locally.
 %%
-%% @param FilterName Name of the filter (atom)
-%% @param HandlerModule Module to handle requests (module)
-%% @param Port Port number for the HTTP service
-%% @return {ok, Pid} if startup is successful
+%% @return `{ok, Pid}' on success, `{error, Reason}' otherwise.
 %% @end
 %%--------------------------------------------------------------------
-start_link(FilterName, HandlerModule, Port) ->
-    SupName = list_to_atom(atom_to_list(FilterName) ++ "_sup"),
-    supervisor:start_link({local, SupName}, ?MODULE, {FilterName, HandlerModule, Port}).
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 %%--------------------------------------------------------------------
-%% @doc Stops the supervisor and its children.
+%% @doc Starts a new filter worker under the supervisor.
 %%
-%% @param SupName Name of the supervisor (atom)
+%% If a filter with the same name is already running, the existing
+%% pid is returned without starting a duplicate.
+%%
+%% @param FilterName    Unique atom identifying the filter instance.
+%% @param HandlerModule Module exporting `handle/1' that will process
+%%                      queries received from `em_disco'.
+%% @return `{ok, Pid}' on success or if already started,
+%%         `{error, Reason}' on failure.
 %% @end
 %%--------------------------------------------------------------------
-stop(SupName) ->
-    supervisor:terminate_child(SupName, all),
-    supervisor:delete_child(SupName, all),
-    supervisor:stop(SupName).
-
-%%====================================================================
-%% Supervisor callbacks
-%%====================================================================
+-spec start_filter(atom(), module()) -> {ok, pid()} | {error, term()}.
+start_filter(FilterName, HandlerModule) ->
+    case supervisor:start_child(?MODULE, [FilterName, HandlerModule]) of
+        {ok, Pid}                       -> {ok, Pid};
+        {error, {already_started, Pid}} -> {ok, Pid};
+        {error, Reason}                 -> {error, Reason}
+    end.
 
 %%--------------------------------------------------------------------
-%% @private
-%% @doc Initializes the supervisor.
+%% @doc Stops the running filter identified by `FilterName'.
 %%
-%% @param {FilterName, HandlerModule, Port} Initialization arguments
-%% @return {ok, {SupFlags, ChildSpecs}} Supervision configuration
+%% Looks up the registered process name `<FilterName>_server' and
+%% asks the supervisor to terminate it.
+%%
+%% @param FilterName Atom used when starting the filter.
+%% @return `ok' on success, `{error, not_running}' if the filter is
+%%         not currently active.
 %% @end
 %%--------------------------------------------------------------------
-init({FilterName, HandlerModule, Port}) ->
-    %% Create ETS table for synchronization if it doesn't exist
-    ets:new(?LOCK_TABLE, [named_table, public, set]),
-
+-spec stop_filter(atom()) -> ok | {error, term()}.
+stop_filter(FilterName) ->
     ServerName = list_to_atom(atom_to_list(FilterName) ++ "_server"),
+    case whereis(ServerName) of
+        undefined -> {error, not_running};
+        Pid       -> supervisor:terminate_child(?MODULE, Pid)
+    end.
 
-    ChildSpecs = [
-        #{
-            id => ServerName,
-            start => {em_filter_server, start_link, [FilterName, HandlerModule, Port]},
-            restart => transient,
-            shutdown => 5000,
-            type => worker,
-            modules => [em_filter_server]
-        }
-    ],
-
-    SupFlags = #{
-        strategy => one_for_one,
-        intensity => 10,
-        period => 30    % Increase period
+%% @private
+init([]) ->
+    Child = #{
+        id       => em_filter_server,
+        start    => {em_filter_server, start_link, []},
+        restart  => permanent,
+        shutdown => 5000,
+        type     => worker,
+        modules  => [em_filter_server]
     },
-
-    %% Wait for the lock to be released before starting the child
-    em_filter_server:wait_for_lock(FilterName),
-
-    {ok, {SupFlags, ChildSpecs}}.
-
+    {ok, {#{strategy  => simple_one_for_one,
+            intensity => 10,
+            period    => 60},
+          [Child]}}.
