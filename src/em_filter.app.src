@@ -1,13 +1,12 @@
 {application, em_filter, [
     {description, "Library simplifies the creation of filters."},
-    {vsn, "0.9.0"},
+    {vsn, "1.0.0"},
     {registered, [em_filter_sup]},
     {mod, {em_filter_app, []}},
     {applications, [
         kernel,
         stdlib,
-        gun,
-        embryo
+        gun
     ]},
     {env, []},
     {modules, [
