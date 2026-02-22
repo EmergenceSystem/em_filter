@@ -1,24 +1,42 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% em_filter 1.0.0 — Public API and HTML Utilities
+%%% em_filter 2.0.0 — Public API and HTML Utilities
 %%%
-%%% Backward-compatible with 0.9: start_filter/2, stop_filter/1 and
-%%% all HTML utility functions have the same signatures.
+%%% Backward-compatible with 1.0.0: start_filter/2, stop_filter/1 and
+%%% all HTML utility functions have the same signatures and behaviour.
 %%%
-%%% Removed in 1.0.0 (unused by any filter):
-%%%   extract_content_blocks/1, aggregate_data/2, classify_content/1,
-%%%   extract_images/1, extract_links_with_text/1, extract_text_blocks/1,
-%%%   extract_media_content/1, format_content/1 and related types.
+%%% Added in 2.0.0:
+%%%   start_agent/3 — starts a filter with optional agent capabilities
+%%%   and optional memory backend.  When started without capabilities
+%%%   and without memory the behaviour is identical to start_filter/2.
+%%%
+%%% Agent config map keys (all optional):
+%%%   `capabilities'  — [binary()] list of capability strings announced
+%%%                     to em_disco via `agent_hello'.  Defaults to [].
+%%%   `memory'        — `none | ets'
+%%%                     `none' (default): no state between queries.
+%%%                     `ets':  per-agent ETS table; memory is a map
+%%%                             passed to HandlerModule:handle/2 and
+%%%                             updated with the returned value.
+%%%
+%%% Handler module contract:
+%%%   Plain filter  — exports `handle/1'  (unchanged from 1.0.0)
+%%%   Agent         — exports `handle/2'  (Body, Memory) -> {Result, NewMemory}
+%%%                   Exporting both is allowed; `handle/2' takes priority
+%%%                   when memory is enabled.
 %%%
 %%% @author Steve Roques
 %%% @end
 %%%-------------------------------------------------------------------
 -module(em_filter).
 
-%% Filter lifecycle (unchanged from 0.9)
+%% Filter lifecycle (unchanged from 1.0.0)
 -export([start_filter/2, stop_filter/1]).
 
-%% HTML utilities (unchanged from 0.9)
+%% Agent lifecycle (new in 2.0.0)
+-export([start_agent/3]).
+
+%% HTML utilities (unchanged from 1.0.0)
 -export([
     strip_scripts/1,
     extract_elements/2,
@@ -41,7 +59,7 @@
 -define(PAT_TAGS, <<"<[^>]*>">>).
 
 %%====================================================================
-%% Filter lifecycle
+%% Filter lifecycle (unchanged from 1.0.0)
 %%====================================================================
 
 -spec start_filter(atom(), module()) -> {ok, pid()} | {error, term()}.
@@ -53,7 +71,42 @@ stop_filter(FilterName) ->
     em_filter_sup:stop_filter(FilterName).
 
 %%====================================================================
-%% HTML utilities
+%% Agent lifecycle (new in 2.0.0)
+%%====================================================================
+
+%%--------------------------------------------------------------------
+%% @doc Starts a filter with optional agent capabilities and memory.
+%%
+%% When called with an empty config map this is equivalent to
+%% `start_filter/2' — no `agent_hello' is sent, no memory is
+%% initialised.
+%%
+%% Example — plain agent with capabilities, no memory:
+%% ```
+%%   em_filter:start_agent(my_agent, my_handler, #{
+%%       capabilities => [<<"summarize">>, <<"llm">>]
+%%   })
+%% '''
+%%
+%% Example — agent with in-process ETS memory:
+%% ```
+%%   em_filter:start_agent(my_agent, my_handler, #{
+%%       capabilities => [<<"summarize">>],
+%%       memory       => ets
+%%   })
+%% '''
+%%
+%% @param AgentName     Unique atom identifying the agent.
+%% @param HandlerModule Module exporting `handle/1' or `handle/2'.
+%% @param Config        Map of agent options (see module doc).
+%% @end
+%%--------------------------------------------------------------------
+-spec start_agent(atom(), module(), map()) -> {ok, pid()} | {error, term()}.
+start_agent(AgentName, HandlerModule, Config) ->
+    em_filter_sup:start_agent(AgentName, HandlerModule, Config).
+
+%%====================================================================
+%% HTML utilities (unchanged from 1.0.0)
 %%====================================================================
 
 -spec strip_scripts(binary() | string()) ->
