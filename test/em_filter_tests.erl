@@ -1,17 +1,12 @@
 -module(em_filter_tests).
 -include_lib("eunit/include/eunit.hrl").
 
-%% Exported so they can be passed as handler modules to em_filter_server
-%% and called via ?MODULE:handle/1,2 in tests.
--export([handle/1, handle/2]).
+%% Exported so they can be passed as handler module to em_filter_server.
+-export([handle/2]).
 
 %% ===================================================================
-%% Inline handler modules
+%% Inline handler — agent contract only
 %% ===================================================================
-
-%% Plain filter handler — used by legacy tests and no-memory agent tests.
-handle(Body) ->
-    json:encode(#{<<"echo">> => Body}).
 
 %% Agent handler with memory — counts queries and accumulates bodies.
 handle(Body, Memory) ->
@@ -34,13 +29,13 @@ stop_app(_) ->
     application:stop(em_filter).
 
 safe_stop(Name) ->
-    case em_filter:stop_filter(Name) of
+    case em_filter:stop_agent(Name) of
         ok                   -> ok;
         {error, not_running} -> ok
     end.
 
 %% ===================================================================
-%% Suite: plain filter lifecycle (unchanged from 1.0.0)
+%% Suite: start_agent/3 — minimal config (replaces old start_filter)
 %% ===================================================================
 
 start_stop_test_() ->
@@ -50,9 +45,9 @@ start_stop_test_() ->
      fun(_) ->
          [
              ?_test(begin
-                 {ok, Pid} = em_filter:start_filter(test_filter, ?MODULE),
+                 {ok, Pid} = em_filter:start_agent(test_filter, ?MODULE, #{}),
                  ?assert(is_pid(Pid)),
-                 ok = em_filter:stop_filter(test_filter)
+                 ok = em_filter:stop_agent(test_filter)
              end)
          ]
      end}.
@@ -68,7 +63,7 @@ agent_no_config_test_() ->
      fun(_) ->
          [
              ?_test(begin
-                 %% Empty config — must behave exactly like start_filter/2.
+                 %% Empty config — minimal agent.
                  {ok, Pid} = em_filter:start_agent(agent_plain, ?MODULE, #{}),
                  ?assert(is_pid(Pid)),
                  safe_stop(agent_plain)
@@ -119,10 +114,10 @@ agent_capabilities_test_() ->
      end}.
 
 %% ===================================================================
-%% Suite: start_agent/3 — memory => none (explicit)
+%% Suite: start_agent/3 — memory => ram (default, no ETS table)
 %% ===================================================================
 
-agent_memory_none_test_() ->
+agent_memory_ram_test_() ->
     {setup,
      fun start_app/0,
      fun stop_app/1,
@@ -130,7 +125,7 @@ agent_memory_none_test_() ->
          [
              ?_test(begin
                  {ok, _} = em_filter:start_agent(agent_no_mem, ?MODULE, #{
-                     memory => none
+                     memory => ram
                  }),
                  %% ETS table must NOT be created.
                  ?assertEqual(undefined, ets:info(agent_no_mem_memory)),
@@ -182,7 +177,7 @@ agent_memory_ets_test_() ->
 %%
 %% The ETS table is `protected' (owned by the server process).
 %% The test process cannot write to it.  We verify the handler
-%% logic in pure isolation instead — no ETS involved here.
+%% logic in pure isolation — no ETS involved here.
 %% ETS lifecycle (create/delete) is covered in agent_memory_ets_test_.
 %% ===================================================================
 
@@ -215,7 +210,7 @@ agent_memory_persistence_test_() ->
     ].
 
 %% ===================================================================
-%% Suite: stop_filter/1 works for both filters and agents
+%% Suite: stop_agent/1 works correctly
 %% ===================================================================
 
 stop_works_for_agents_test_() ->
@@ -230,7 +225,7 @@ stop_works_for_agents_test_() ->
                      memory       => ets
                  }),
                  ?assert(is_pid(whereis(agent_stop_server))),
-                 ok = em_filter:stop_filter(agent_stop),
+                 ok = em_filter:stop_agent(agent_stop),
                  timer:sleep(100),
                  ?assertEqual(undefined, whereis(agent_stop_server))
              end),
@@ -238,7 +233,7 @@ stop_works_for_agents_test_() ->
                  %% Stopping a non-existent agent must return an error,
                  %% not crash.
                  ?assertEqual({error, not_running},
-                              em_filter:stop_filter(ghost_agent))
+                              em_filter:stop_agent(ghost_agent))
              end)
          ]
      end}.
