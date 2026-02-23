@@ -1,42 +1,38 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% em_filter 2.0.0 — Public API and HTML Utilities
+%%% em_filter — Public API and HTML Utilities
 %%%
-%%% Backward-compatible with 1.0.0: start_filter/2, stop_filter/1 and
-%%% all HTML utility functions have the same signatures and behaviour.
+%%% All nodes in the Emergence system are agents. The Queen connects
+%%% to em_disco the same way any other agent does.
 %%%
-%%% Added in 2.0.0:
-%%%   start_agent/3 — starts a filter with optional agent capabilities
-%%%   and optional memory backend.  When started without capabilities
-%%%   and without memory the behaviour is identical to start_filter/2.
+%%% === Handler contract ===
 %%%
-%%% Agent config map keys (all optional):
-%%%   `capabilities'  — [binary()] list of capability strings announced
-%%%                     to em_disco via `agent_hello'.  Defaults to [].
-%%%   `memory'        — `none | ets'
-%%%                     `none' (default): no state between queries.
-%%%                     `ets':  per-agent ETS table; memory is a map
-%%%                             passed to HandlerModule:handle/2 and
-%%%                             updated with the returned value.
+%%%   Every handler module must export:
 %%%
-%%% Handler module contract:
-%%%   Plain filter  — exports `handle/1'  (unchanged from 1.0.0)
-%%%   Agent         — exports `handle/2'  (Body, Memory) -> {Result, NewMemory}
-%%%                   Exporting both is allowed; `handle/2' takes priority
-%%%                   when memory is enabled.
+%%%     handle(Body :: binary(), Memory :: map()) ->
+%%%         {Result :: term(), NewMemory :: map()}
+%%%
+%%%   Memory is always a live map. Returning the same map as NewMemory
+%%%   is valid for stateless behaviour — no special config needed.
+%%%
+%%% === Config map keys (all optional) ===
+%%%
+%%%   capabilities => [binary()]
+%%%       Announced to em_disco via agent_hello. Defaults to [].
+%%%
+%%%   memory => ram | ets
+%%%       ram (default): memory lives in the gen_server state and
+%%%           resets to #{} if the worker is restarted.
+%%%       ets: memory is persisted in an ETS table and survives
+%%%           worker restarts within the same BEAM session.
 %%%
 %%% @author Steve Roques
 %%% @end
 %%%-------------------------------------------------------------------
 -module(em_filter).
 
-%% Filter lifecycle (unchanged from 1.0.0)
--export([start_filter/2, stop_filter/1]).
+-export([start_agent/3, stop_agent/1]).
 
-%% Agent lifecycle (new in 2.0.0)
--export([start_agent/3]).
-
-%% HTML utilities (unchanged from 1.0.0)
 -export([
     strip_scripts/1,
     extract_elements/2,
@@ -59,54 +55,19 @@
 -define(PAT_TAGS, <<"<[^>]*>">>).
 
 %%====================================================================
-%% Filter lifecycle (unchanged from 1.0.0)
+%% Agent lifecycle
 %%====================================================================
 
--spec start_filter(atom(), module()) -> {ok, pid()} | {error, term()}.
-start_filter(FilterName, HandlerModule) ->
-    em_filter_sup:start_filter(FilterName, HandlerModule).
-
--spec stop_filter(atom()) -> ok | {error, term()}.
-stop_filter(FilterName) ->
-    em_filter_sup:stop_filter(FilterName).
-
-%%====================================================================
-%% Agent lifecycle (new in 2.0.0)
-%%====================================================================
-
-%%--------------------------------------------------------------------
-%% @doc Starts a filter with optional agent capabilities and memory.
-%%
-%% When called with an empty config map this is equivalent to
-%% `start_filter/2' — no `agent_hello' is sent, no memory is
-%% initialised.
-%%
-%% Example — plain agent with capabilities, no memory:
-%% ```
-%%   em_filter:start_agent(my_agent, my_handler, #{
-%%       capabilities => [<<"summarize">>, <<"llm">>]
-%%   })
-%% '''
-%%
-%% Example — agent with in-process ETS memory:
-%% ```
-%%   em_filter:start_agent(my_agent, my_handler, #{
-%%       capabilities => [<<"summarize">>],
-%%       memory       => ets
-%%   })
-%% '''
-%%
-%% @param AgentName     Unique atom identifying the agent.
-%% @param HandlerModule Module exporting `handle/1' or `handle/2'.
-%% @param Config        Map of agent options (see module doc).
-%% @end
-%%--------------------------------------------------------------------
 -spec start_agent(atom(), module(), map()) -> {ok, pid()} | {error, term()}.
 start_agent(AgentName, HandlerModule, Config) ->
     em_filter_sup:start_agent(AgentName, HandlerModule, Config).
 
+-spec stop_agent(atom()) -> ok | {error, term()}.
+stop_agent(AgentName) ->
+    em_filter_sup:stop_agent(AgentName).
+
 %%====================================================================
-%% HTML utilities (unchanged from 1.0.0)
+%% HTML utilities
 %%====================================================================
 
 -spec strip_scripts(binary() | string()) ->
@@ -159,7 +120,7 @@ extract_attribute(E, Attr) ->
 
 -spec clean_text(term(), term(), term()) -> binary().
 clean_text(D, I, Dt) ->
-    T1 = safe_binary_replace(ensure_binary(D), ensure_binary(I),  <<>>),
+    T1 = safe_binary_replace(ensure_binary(D), ensure_binary(I), <<>>),
     T2 = safe_binary_replace(T1, ensure_binary(Dt), <<>>),
     decode_html_entities(safe_binary_replace(T2, <<" . ">>, <<>>)).
 
@@ -268,7 +229,8 @@ generic_selector(Html, Selector) ->
             re:run(Html, "<[^>]*" ++ Attr ++ "=['\"]" ++ Value ++
                    "['\"][^>]*>(.*?)</[^>]+>",
                    [global, dotall, {capture, all_but_first, binary}]);
-        error -> {match, []}
+        error ->
+            {match, []}
     end.
 
 parse_sel([$# | Id])    -> {id, Id};

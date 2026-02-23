@@ -1,6 +1,6 @@
 {application, em_filter, [
-    {description, "Library simplifies the creation of filters."},
-    {vsn, "1.1.0"},
+    {description, "Agent connectivity for Emergence system."},
+    {vsn, "1.2.0"},
     {registered, [em_filter_sup]},
     {mod, {em_filter_app, []}},
     {applications, [

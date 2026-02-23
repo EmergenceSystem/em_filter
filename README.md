@@ -3,25 +3,37 @@
 [![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/em_filter)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE.md)
 
-An Erlang library for building Emergence filters and agents connected to an `em_disco` discovery service.
+An Erlang library for building Emergence agents connected to an `em_disco` discovery service.
 
 ## Features
 
-- Connects your filter or agent to `em_disco` over a persistent WebSocket
+- Connects your agent to `em_disco` over a persistent WebSocket
 - Automatically registers on startup and reconnects on failure
-- Optionally announces agent capabilities to the `em_disco` registry
-- Optionally enables per-agent memory (ETS) passed across queries
+- Announces agent capabilities to the `em_disco` registry via `agent_hello`
+- Optional persistent memory (ETS) passed across queries
 - Full set of HTML scraping utilities included
 
 ## Concepts
 
-**Filter** — stateless node. Receives a query, returns results, remembers nothing. This is the 1.0.0 behaviour, unchanged.
+Every node in the Emergence system is an **agent**. The Queen connects to `em_disco` the same way any other agent does.
 
-**Agent** — extends a filter with two optional features:
-- **Capabilities** — a list of strings (`<<"summarize">>`, `<<"llm">>`, …) announced to `em_disco` at startup via `agent_hello`. The Queen agent reads `GET /registry` to discover them.
-- **Memory** — a persistent map passed to `handle/2` on every query and updated with the returned value. Backed by a local ETS table.
+An agent has two optional features:
 
-A filter started without capabilities or memory is identical to a 1.0.0 filter.
+- **Capabilities** — a list of strings (`<<"summarize">>`, `<<"llm">>`, …) announced to `em_disco` at startup. The Queen reads `GET /registry` to discover them.
+- **Memory** — a map passed to `handle/2` on every query and updated with the returned value.
+  - `ram` (default): lives in the process state, resets to `#{}` on restart.
+  - `ets`: persisted in a local ETS table, survives worker restarts within the same BEAM session.
+
+### Handler contract
+
+Every handler module must export `handle/2`:
+
+```erlang
+handle(Body :: binary(), Memory :: map()) ->
+    {Result :: term(), NewMemory :: map()}
+```
+
+Returning the same map as `NewMemory` is valid for stateless behaviour — no special config needed.
 
 ## Installation
 
@@ -29,31 +41,15 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {em_filter, "1.1.0"}
+    {em_filter, "1.2.0"}
 ]}.
 ```
 
 ## Usage
 
-### Plain filter (unchanged from 1.0.0)
+### Stateless agent
 
-```erlang
--module(my_filter).
--export([handle/1]).
-
-handle(Body) ->
-    %% fetch, scrape, compute — return a JSON-encodable term
-    json:encode(#{<<"embryo_list">> => []}).
-```
-
-```erlang
-em_filter:start_filter(my_filter, my_filter).
-```
-
-### Agent with capabilities (no memory)
-
-Announces itself to `em_disco` so the Queen can find it via `GET /registry`.
-`handle/1` is still used — behaviour is stateless.
+Announces capabilities but does not persist state between queries.
 
 ```erlang
 em_filter:start_agent(my_agent, my_handler, #{
@@ -61,25 +57,44 @@ em_filter:start_agent(my_agent, my_handler, #{
 }).
 ```
 
-### Agent with memory
+```erlang
+-module(my_handler).
+-export([handle/2]).
 
-`handle/2` receives the current memory map and must return `{Result, NewMemory}`.
-The updated memory is stored in a local ETS table and passed on the next query.
+handle(Body, Memory) ->
+    Result = do_work(Body),
+    {json:encode(Result), Memory}.  % Memory returned unchanged
+```
+
+### Agent with persistent memory
+
+`handle/2` receives the current memory map and returns `{Result, NewMemory}`.
+The updated memory is stored and passed on the next query.
 
 ```erlang
 -module(my_agent).
 -export([handle/2]).
 
 handle(Body, Memory) ->
-    Seen    = maps:get(seen, Memory, []),
-    Result  = do_work(Body, Seen),
-    NewMem  = Memory#{seen => [Body | Seen]},
-    {json:encode(Result), NewMem}.
+    Seen   = maps:get(seen, Memory, []),
+    Result = do_work(Body, Seen),
+    {json:encode(Result), Memory#{seen => [Body | Seen]}}.
 ```
 
 ```erlang
 em_filter:start_agent(my_agent, my_agent, #{
     capabilities => [<<"summarize">>],
+    memory       => ets
+}).
+```
+
+### The Queen
+
+The Queen is just an agent with an `orchestrate` capability — no special API.
+
+```erlang
+em_filter:start_agent(queen, queen_handler, #{
+    capabilities => [<<"orchestrate">>],
     memory       => ets
 }).
 ```
@@ -102,7 +117,7 @@ port = 8080
 
 ## HTML utilities
 
-The following helpers are available for filters that scrape HTML:
+The following helpers are available for agents that scrape HTML:
 
 | Function | Description |
 |---|---|
