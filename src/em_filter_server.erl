@@ -2,40 +2,25 @@
 %%% @doc
 %%% WebSocket Client for em_disco Connectivity
 %%%
-%%% `em_filter_server' manages a single persistent WebSocket connection
-%%% to ONE em_disco node on behalf of one agent.
+%%% Manages a single persistent WebSocket connection to ONE em_disco
+%%% node. em_filter_sup starts one server per configured disco node.
 %%%
-%%% em_filter_sup starts one em_filter_server per configured disco node,
-%%% so an agent with N nodes in its config runs N parallel workers —
-%%% each receiving queries from its disco and replying independently.
+%%% Transport is determined by em_filter_sup:read_disco_nodes/0:
+%%%   tcp — plain WebSocket  (ws://)
+%%%   tls — TLS  WebSocket  (wss://)
 %%%
 %%% === Startup sequence ===
 %%%
-%%%   1. Open a Gun HTTP connection to the disco address.
+%%%   1. Open a Gun connection (tcp or tls) to the disco address.
 %%%   2. Upgrade to WebSocket on /ws.
-%%%   3. Send a `register' frame to announce the agent name.
-%%%   4. Send an `agent_hello' frame with capabilities (if any).
+%%%   3. Send a register frame to announce the agent name.
+%%%   4. Send an agent_hello frame with capabilities (if any).
 %%%   5. Initialise the memory backend.
-%%%
-%%% === Dispatch ===
-%%%
-%%% Every incoming query frame is dispatched to:
-%%%
-%%%   HandlerModule:handle(Body :: binary(), Memory :: map()) ->
-%%%       {Result :: term(), NewMemory :: map()}
 %%%
 %%% === Reconnection ===
 %%%
-%%% On WS close or connection loss the gen_server stops; the supervisor
-%%% restarts it, which reconnects the agent to em_disco.
-%%%
-%%% === Disco address resolution (priority order) ===
-%%%
-%%%   1. {Host, Port} passed explicitly by em_filter_sup.
-%%%   2. EM_DISCO_HOST / EM_DISCO_PORT environment variables
-%%%      (used only when sup passes no explicit address).
-%%%   3. [em_disco] nodes list in emergence.conf.
-%%%   4. Default: {"localhost", 8080}.
+%%% On WS close or connection loss the gen_server stops and the
+%%% supervisor restarts it, which reconnects the agent to em_disco.
 %%%
 %%% @author Steve Roques
 %%% @end
@@ -66,35 +51,40 @@
 %%--------------------------------------------------------------------
 %% @doc Starts a server linked to one specific disco node.
 %%
-%% ServerName is derived from AgentName + node index so multiple
-%% workers for the same agent have distinct registered names.
+%% The server name encodes host + port so multiple workers for the
+%% same agent have distinct registered names:
+%%   rss_filter_localhost_8080_server
+%%   rss_filter_em_disco_roques_me_443_server
 %% @end
 %%--------------------------------------------------------------------
--spec start_link(atom(), module(), map(), {string(), inet:port_number()}) ->
+-spec start_link(atom(), module(), map(),
+                 {string(), inet:port_number(), tcp | tls}) ->
     {ok, pid()} | {error, term()}.
-start_link(AgentName, HandlerModule, Config, {Host, Port}) ->
-    %% Encode host into the server name so each disco node gets its
-    %% own registered process — avoids name clashes when an agent
-    %% connects to multiple disco nodes.
-    SafeHost  = re:replace(Host, "[^a-zA-Z0-9]", "_", [global, {return, list}]),
-    ServerName = list_to_atom(atom_to_list(AgentName) ++ "_" ++ SafeHost
-                              ++ "_" ++ integer_to_list(Port)),
+start_link(AgentName, HandlerModule, Config, {Host, Port, Transport}) ->
+    SafeHost   = re:replace(Host, "[^a-zA-Z0-9]", "_",
+                            [global, {return, list}]),
+    ServerName = list_to_atom(atom_to_list(AgentName)
+                              ++ "_" ++ SafeHost
+                              ++ "_" ++ integer_to_list(Port)
+                              ++ "_server"),
     gen_server:start_link({local, ServerName}, ?MODULE,
-                          {AgentName, HandlerModule, Config, Host, Port}, []).
+                          {AgentName, HandlerModule, Config,
+                           Host, Port, Transport}, []).
 
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
 
-init({AgentName, HandlerModule, Config, Host, Port}) ->
-    {ok, ConnPid} = gun:open(Host, Port, #{protocols => [http]}),
+init({AgentName, HandlerModule, Config, Host, Port, Transport}) ->
+    GunOpts = gun_opts(Transport),
+    {ok, ConnPid} = gun:open(Host, Port, GunOpts),
     case gun:await_up(ConnPid, ?CONNECT_TIMEOUT) of
         {ok, _} ->
             StreamRef = gun:ws_upgrade(ConnPid, "/ws"),
             receive
                 {gun_upgrade, ConnPid, StreamRef, [<<"websocket">>], _} ->
-                    register_on_disco(ConnPid, StreamRef, AgentName, Config,
-                                      Host, Port),
+                    register_on_disco(ConnPid, StreamRef, AgentName,
+                                      Config, Host, Port),
                     {Memory, MemTable} = init_memory(AgentName, Config),
                     {ok, #state{
                         agent_name     = AgentName,
@@ -162,6 +152,23 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% Internal helpers
 %%====================================================================
 
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Builds Gun options for the given transport.
+%%
+%% TLS uses default system CA store — works for Let's Encrypt certs
+%% without any extra configuration.
+%% @end
+%%--------------------------------------------------------------------
+-spec gun_opts(tcp | tls) -> map().
+gun_opts(tcp) ->
+    #{protocols => [http]};
+gun_opts(tls) ->
+    #{protocols  => [http],
+      transport  => tls,
+      tls_opts   => [{verify, verify_peer},
+                     {cacerts, public_key:cacerts_get()}]}.
+
 register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
     gun:ws_send(ConnPid, StreamRef,
         {text, json:encode(#{
@@ -178,7 +185,8 @@ register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
                     <<"action">>       => <<"agent_hello">>,
                     <<"capabilities">> => Caps
                 })}),
-            logger:info("[em_filter] ~s agent_hello caps=~p", [AgentName, Caps])
+            logger:info("[em_filter] ~s agent_hello caps=~p",
+                        [AgentName, Caps])
     end.
 
 -spec dispatch(binary(), #state{}) -> {term(), #state{}}.
@@ -197,7 +205,8 @@ dispatch(Body, #state{handler_module = Mod,
 
 -spec persist_memory(atom() | undefined, map()) -> ok.
 persist_memory(undefined, _Memory) -> ok;
-persist_memory(Table, Memory)      -> ets:insert(Table, {memory, Memory}), ok.
+persist_memory(Table, Memory)      ->
+    ets:insert(Table, {memory, Memory}), ok.
 
 -spec init_memory(atom(), map()) -> {map(), atom() | undefined}.
 init_memory(AgentName, #{memory := ets}) ->

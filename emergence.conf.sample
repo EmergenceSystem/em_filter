@@ -1,0 +1,5 @@
+[em_disco]
+nodes = localhost:8080, em_disco.domain.xyz
+
+[emquest]
+port = 8079
