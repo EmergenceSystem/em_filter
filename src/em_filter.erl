@@ -60,14 +60,6 @@
  
 %%--------------------------------------------------------------------
 %% @doc Returns the root capabilities shared by all em_filter agents.
-%%
-%% Sub-libraries extend these:
-%%   rss_filter_app:base_capabilities()
-%%     → em_filter:base_capabilities() ++ [<<"rss">>, <<"feeds">>, ...]
-%%
-%% Site-specific filters extend their parent lib:
-%%   capabilities => rss_filter_app:base_capabilities()
-%%                   ++ [<<"motorsport">>, <<"f1">>]
 %% @end
 %%--------------------------------------------------------------------
 -spec base_capabilities() -> [binary()].
