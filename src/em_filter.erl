@@ -31,7 +31,7 @@
 %%%-------------------------------------------------------------------
 -module(em_filter).
 
--export([start_agent/3, stop_agent/1]).
+-export([start_agent/3, stop_agent/1, base_capabilities/0]).
 
 -export([
     strip_scripts/1,
@@ -53,6 +53,26 @@
 -define(PAT_HEX,  <<"&#x([0-9A-Fa-f]+);">>).
 -define(PAT_NAM,  <<"&([a-zA-Z]+);">>).
 -define(PAT_TAGS, <<"<[^>]*>">>).
+
+%%====================================================================
+%% Capability cascade root
+%%====================================================================
+ 
+%%--------------------------------------------------------------------
+%% @doc Returns the root capabilities shared by all em_filter agents.
+%%
+%% Sub-libraries extend these:
+%%   rss_filter_app:base_capabilities()
+%%     → em_filter:base_capabilities() ++ [<<"rss">>, <<"feeds">>, ...]
+%%
+%% Site-specific filters extend their parent lib:
+%%   capabilities => rss_filter_app:base_capabilities()
+%%                   ++ [<<"motorsport">>, <<"f1">>]
+%% @end
+%%--------------------------------------------------------------------
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    [<<"search">>, <<"query">>].
 
 %%====================================================================
 %% Agent lifecycle
