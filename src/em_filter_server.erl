@@ -9,6 +9,10 @@
 %%%   tcp — plain WebSocket  (ws://)
 %%%   tls — TLS  WebSocket  (wss://)
 %%%
+%%% TLS uses verify_peer with the system CA store and sets SNI to the
+%%% target host dynamically so wildcard certificates (*.roques.me) are
+%%% accepted correctly by the Erlang SSL stack.
+%%%
 %%% === Startup sequence ===
 %%%
 %%%   1. Open a Gun connection (tcp or tls) to the disco address.
@@ -76,7 +80,9 @@ start_link(AgentName, HandlerModule, Config, {Host, Port, Transport}) ->
 %%====================================================================
 
 init({AgentName, HandlerModule, Config, Host, Port, Transport}) ->
-    GunOpts = gun_opts(Transport),
+    %% Pass Host to gun_opts so SNI is set dynamically — required for
+    %% wildcard TLS certificates (e.g. *.roques.me).
+    GunOpts = gun_opts(Transport, Host),
     {ok, ConnPid} = gun:open(Host, Port, GunOpts),
     case gun:await_up(ConnPid, ?CONNECT_TIMEOUT) of
         {ok, _} ->
@@ -156,18 +162,20 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% @private
 %% @doc Builds Gun options for the given transport.
 %%
-%% TLS uses default system CA store — works for Let's Encrypt certs
-%% without any extra configuration.
+%% tcp — plain connection, no TLS.
+%% tls — TLS with system CA store and SNI set to Host so wildcard
+%%       certificates (e.g. *.roques.me) are validated correctly.
 %% @end
 %%--------------------------------------------------------------------
--spec gun_opts(tcp | tls) -> map().
-gun_opts(tcp) ->
+-spec gun_opts(tcp | tls, string()) -> map().
+gun_opts(tcp, _Host) ->
     #{protocols => [http]};
-gun_opts(tls) ->
-    #{protocols  => [http],
-      transport  => tls,
-      tls_opts   => [{verify, verify_peer},
-                     {cacerts, public_key:cacerts_get()}]}.
+gun_opts(tls, Host) ->
+    #{protocols => [http],
+      transport => tls,
+      tls_opts  => [{verify, verify_peer},
+                    {cacerts, public_key:cacerts_get()},
+                    {server_name_indication, Host}]}.
 
 register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
     gun:ws_send(ConnPid, StreamRef,
