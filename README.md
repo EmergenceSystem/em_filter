@@ -85,7 +85,7 @@ handle(Body, Memory) ->
 
 ### Agent with memory (cache)
 
-Memory is useful for caching — not for filtering already-seen results.
+Memory is useful for caching.
 
 ```erlang
 -module(my_handler).
