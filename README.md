@@ -7,7 +7,7 @@ An Erlang library for building Emergence agents connected to an `em_disco` disco
 
 ## Features
 
-- Connects your agent to `em_disco` over a persistent WebSocket
+- Connects your agent to one or more `em_disco` nodes over persistent WebSockets
 - Automatically registers on startup and reconnects on failure
 - Announces agent capabilities to the `em_disco` registry via `agent_hello`
 - Optional persistent memory (ETS) passed across queries
@@ -15,14 +15,15 @@ An Erlang library for building Emergence agents connected to an `em_disco` disco
 
 ## Concepts
 
-Every node in the Emergence system is an **agent**. The Queen connects to `em_disco` the same way any other agent does.
+Every node in the Emergence system is an **agent**. An agent has two optional features:
 
-An agent has two optional features:
-
-- **Capabilities** — a list of strings (`<<"summarize">>`, `<<"llm">>`, …) announced to `em_disco` at startup. The Queen reads `GET /registry` to discover them.
+- **Capabilities** — a list of strings (`<<"rss">>`, `<<"dns">>`, …) announced to `em_disco` at startup. Used by disco to route queries to relevant agents only.
 - **Memory** — a map passed to `handle/2` on every query and updated with the returned value.
   - `ram` (default): lives in the process state, resets to `#{}` on restart.
   - `ets`: persisted in a local ETS table, survives worker restarts within the same BEAM session.
+
+Memory is best used for caching expensive operations (HTTP responses, DNS lookups, rate limit state).
+**Do not use memory to deduplicate results** — deduplication is handled upstream by the Emquest pipeline.
 
 ### Handler contract
 
@@ -33,7 +34,23 @@ handle(Body :: binary(), Memory :: map()) ->
     {Result :: term(), NewMemory :: map()}
 ```
 
-Returning the same map as `NewMemory` is valid for stateless behaviour — no special config needed.
+`Body` is the raw JSON query binary. `Result` is typically a list of embryo maps.
+Returning the same map as `NewMemory` is valid for stateless behaviour.
+
+### Embryo format
+
+Agents return a list of embryo maps:
+
+```erlang
+#{
+    <<"type">>       => <<"rss">>,        %% agent-defined type
+    <<"properties">> => #{
+        <<"url">>    => <<"https://...">>,
+        <<"title">>  => <<"...">>,
+        <<"resume">> => <<"...">>
+    }
+}
+```
 
 ## Installation
 
@@ -53,7 +70,7 @@ Announces capabilities but does not persist state between queries.
 
 ```erlang
 em_filter:start_agent(my_agent, my_handler, #{
-    capabilities => [<<"summarize">>, <<"llm">>]
+    capabilities => [<<"search">>, <<"web">>]
 }).
 ```
 
@@ -62,57 +79,74 @@ em_filter:start_agent(my_agent, my_handler, #{
 -export([handle/2]).
 
 handle(Body, Memory) ->
-    Result = do_work(Body),
-    {json:encode(Result), Memory}.  % Memory returned unchanged
+    Results = do_search(Body),
+    {Results, Memory}.
 ```
 
-### Agent with persistent memory
+### Agent with memory (cache)
 
-`handle/2` receives the current memory map and returns `{Result, NewMemory}`.
-The updated memory is stored and passed on the next query.
+Memory is useful for caching — not for filtering already-seen results.
 
 ```erlang
--module(my_agent).
+-module(my_handler).
 -export([handle/2]).
 
 handle(Body, Memory) ->
-    Seen   = maps:get(seen, Memory, []),
-    Result = do_work(Body, Seen),
-    {json:encode(Result), Memory#{seen => [Body | Seen]}}.
+    Cache = maps:get(cache, Memory, #{}),
+    case maps:get(Body, Cache, undefined) of
+        undefined ->
+            Results  = fetch_from_api(Body),
+            NewCache = Cache#{Body => Results},
+            {Results, Memory#{cache => NewCache}};
+        Cached ->
+            {Cached, Memory}
+    end.
 ```
 
 ```erlang
-em_filter:start_agent(my_agent, my_agent, #{
-    capabilities => [<<"summarize">>],
+em_filter:start_agent(my_agent, my_handler, #{
+    capabilities => [<<"search">>],
     memory       => ets
 }).
 ```
 
-### The Queen
+## Multi-disco connectivity
 
-The Queen is just an agent with an `orchestrate` capability — no special API.
+An agent connects to every disco node listed in `emergence.conf`.
+Each node gets its own persistent WebSocket connection and worker process.
 
-```erlang
-em_filter:start_agent(queen, queen_handler, #{
-    capabilities => [<<"orchestrate">>],
-    memory       => ets
-}).
+```ini
+[em_disco]
+nodes = localhost:8080, em-disco.roques.me
 ```
+
+With this config, `start_agent/3` spawns two workers automatically:
+- `my_agent_localhost_8080_server` — connected to local disco
+- `my_agent_em_disco_roques_me_443_server` — connected to public disco
+
+Port and transport resolution:
+- `localhost` / `127.0.0.1` → port 8080, plain TCP (default)
+- any other host without port → port 443, TLS (default)
+- explicit port 443 → TLS
+- any other explicit port → plain TCP
 
 ## Configuration
 
 The `em_disco` address is resolved in this order:
 
-1. Environment variables `EM_DISCO_HOST` / `EM_DISCO_PORT`
-2. `~/.config/emergence/emergence.conf` (Linux/macOS) or `%APPDATA%\emergence\emergence.conf` (Windows)
-3. Defaults: `localhost:8080`
+1. `[em_disco] nodes` in `emergence.conf` (recommended)
+2. `EM_DISCO_HOST` / `EM_DISCO_PORT` environment variables (legacy, single node)
+3. Default: `localhost:8080`
 
-`emergence.conf` example:
+`emergence.conf` locations:
+- Linux/macOS: `~/.config/emergence/emergence.conf`
+- Windows: `%APPDATA%\emergence\emergence.conf`
+
+Full example:
 
 ```ini
 [em_disco]
-host = 192.168.1.10
-port = 8080
+nodes = localhost:8080, em-disco.roques.me
 ```
 
 ## HTML utilities
@@ -126,7 +160,7 @@ The following helpers are available for agents that scrape HTML:
 | `get_text/1` | Strips all HTML tags |
 | `extract_attribute/2` | Extracts a tag attribute value |
 | `clean_text/3` | Strips noise and decodes entities |
-| `decode_html_entities/1` | Decodes `&amp;`, `&#x…;`, `&#…;` |
+| `decode_html_entities/1` | Decodes `&amp;`, `&#x...;`, `&#...;` |
 | `should_skip_link/2` | Filters out unwanted URLs |
 
 ## License
