@@ -1,6 +1,6 @@
 {application, em_filter, [
     {description, "Agent connectivity for Emergence system."},
-    {vsn, "1.2.2"},
+    {vsn, "1.2.3"},
     {registered, [em_filter_sup]},
     {mod, {em_filter_app, []}},
     {applications, [
