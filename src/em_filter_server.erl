@@ -168,8 +168,6 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% @end
 %%--------------------------------------------------------------------
 -spec gun_opts(tcp | tls, string()) -> map().
-gun_opts(tcp, _Host) ->
-    #{protocols => [http]};
 gun_opts(tls, Host) ->
     Sni = case is_binary(Host) of
         true  -> binary_to_list(Host);
@@ -182,7 +180,9 @@ gun_opts(tls, Host) ->
                     {server_name_indication, Sni},
                     {customize_hostname_check,
                      [{match_fun,
-                       public_key:pkix_verify_hostname_match_fun(https)}]}]}.
+                       public_key:pkix_verify_hostname_match_fun(https)}]}]};
+gun_opts(tcp, _Host) ->
+    #{protocols => [http]}.
 
 register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
     gun:ws_send(ConnPid, StreamRef,
