@@ -168,8 +168,8 @@ handle_info(connect, #state{host       = Host,
                          [<<"websocket">>], _} ->
                             register_on_disco(ConnPid, StreamRef,
                                               Name, Config, Host, Port),
-                            logger:info("Agent connected",
-                                #{agent => Name, host => Host, port => Port}),
+                            logger:notice("[em_filter] agent connected: ~ts @ ~s:~p",
+                                [Name, Host, Port]),
                             {noreply, State#state{
                                 conn_pid        = ConnPid,
                                 stream_ref      = StreamRef,

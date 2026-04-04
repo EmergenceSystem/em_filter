@@ -13,7 +13,7 @@ em_filter is the library side of this: it handles the WebSocket connection to em
 
 ## Features
 
-- Connects your agent to one or more `em_disco` nodes over persistent WebSockets
+- Connects your agent to one or more `em_disco` nodes configured in `emergence.conf` over persistent WebSockets
 - Automatically registers on startup and reconnects on failure
 - Announces agent capabilities to the `em_disco` registry via `agent_hello`
 - Optional persistent memory (ETS) passed across queries
@@ -64,7 +64,7 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {em_filter, "1.2.3"}
+    {em_filter, "1.2.4"}
 ]}.
 ```
 
@@ -157,10 +157,11 @@ nodes = localhost:8080, em-disco.roques.me
 
 ## Console output
 
-When running, em_filter logs one line per incoming query:
+When running, em_filter logs two events at the `notice` level:
 
 ```
-[notice] [em_filter] query: <body>
+[em_filter] agent connected: my_agent @ localhost:8080
+[em_filter] query: <body>
 ```
 
 Connection warnings (auth rejected, timeout, unreachable) are logged at the `warning` level. OTP startup progress reports are suppressed.
