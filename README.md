@@ -5,6 +5,12 @@
 
 An Erlang library for building Emergence agents connected to an `em_disco` discovery service.
 
+## Philosophy
+
+Emergence is a distributed discovery network, not a search engine with a central index. Any agent can contribute any result type. Emquest (the web gateway) fans out queries across all connected agents in parallel, deduplicates results by URL, and streams cards to the browser in real time.
+
+em_filter is the library side of this: it handles the WebSocket connection to em_disco, receives queries, calls your handler, and sends results back. Your handler focuses entirely on one thing — turning a query into a list of result maps (embryos).
+
 ## Features
 
 - Connects your agent to one or more `em_disco` nodes over persistent WebSockets
@@ -121,8 +127,8 @@ nodes = localhost:8080, em-disco.roques.me
 ```
 
 With this config, `start_agent/3` spawns two workers automatically:
-- `my_agent_localhost_8080_server` — connected to local disco
-- `my_agent_em_disco_roques_me_443_server` — connected to public disco
+- `my_agent_server` — connected to local disco (index 1)
+- `my_agent_server_2` — connected to public disco (index 2)
 
 Port and transport resolution:
 - `localhost` / `127.0.0.1` → port 8080, plain TCP (default)
@@ -148,6 +154,16 @@ Full example:
 [em_disco]
 nodes = localhost:8080, em-disco.roques.me
 ```
+
+## Console output
+
+When running, em_filter logs one line per incoming query:
+
+```
+[notice] [em_filter] query: <body>
+```
+
+Connection warnings (auth rejected, timeout, unreachable) are logged at the `warning` level. OTP startup progress reports are suppressed.
 
 ## HTML utilities
 
