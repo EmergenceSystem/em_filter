@@ -26,6 +26,7 @@
 %% @return `{ok, Pid}' where `Pid' is the supervisor pid.
 %% @end
 %%--------------------------------------------------------------------
+-spec start(application:start_type(), term()) -> {ok, pid()} | {error, term()}.
 start(_StartType, _StartArgs) ->
     logger:add_primary_filter(no_progress,
         {fun logger_filters:progress/2, stop}),
@@ -41,5 +42,6 @@ start(_StartType, _StartArgs) ->
 %% @return `ok'.
 %% @end
 %%--------------------------------------------------------------------
+-spec stop(term()) -> ok.
 stop(_State) ->
     ok.

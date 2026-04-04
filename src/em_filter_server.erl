@@ -88,6 +88,16 @@ start_link(AgentName, HandlerModule, Config, {Host, Port, Transport}, Index) ->
 %% gen_server callbacks
 %%====================================================================
 
+%%--------------------------------------------------------------------
+%% @doc Initialises the server state and schedules the first connection attempt.
+%%
+%% Memory is loaded from ETS if `memory => ets' is configured, otherwise
+%% starts as an empty map. The actual WebSocket connection is deferred to
+%% the first `handle_info(connect, ...)' call.
+%% @end
+%%--------------------------------------------------------------------
+-spec init({atom(), module(), map(), string(), inet:port_number(), tcp | tls}) ->
+    {ok, #state{}}.
 init({AgentName, HandlerModule, Config, Host, Port, Transport}) ->
     {Memory, MemTable} = init_memory(AgentName, Config),
     self() ! connect,
@@ -247,9 +257,26 @@ handle_info({gun_down, _C, _P, _Reason, _}, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
+%%--------------------------------------------------------------------
+%% @doc No synchronous calls — returns `ok' for any request.
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_call(term(), {pid(), term()}, #state{}) -> {reply, ok, #state{}}.
 handle_call(_Req, _From, State) -> {reply, ok, State}.
+
+%%--------------------------------------------------------------------
+%% @doc No asynchronous casts handled.
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(_Msg, State)        -> {noreply, State}.
 
+%%--------------------------------------------------------------------
+%% @doc Cancels the reconnect timer, closes the Gun connection, and
+%% deletes the ETS memory table if one was created.
+%% @end
+%%--------------------------------------------------------------------
+-spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{conn_pid        = ConnPid,
                            memory_table   = Table,
                            reconnect_timer = Timer}) ->
@@ -269,6 +296,7 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% Internal helpers
 %%====================================================================
 
+%% @private
 -spec server_name(atom(), pos_integer()) -> atom().
 server_name(AgentName, 1) ->
     list_to_atom(atom_to_list(AgentName) ++ "_server");
@@ -276,6 +304,7 @@ server_name(AgentName, N) ->
     list_to_atom(atom_to_list(AgentName) ++ "_server_" ++ integer_to_list(N)).
 
 %%--------------------------------------------------------------------
+%% @private
 %% @doc Builds Gun transport options.
 %%
 %% tcp — plain connection.
@@ -301,6 +330,7 @@ gun_opts(tcp, _Host) ->
     #{protocols => [http]}.
 
 %%--------------------------------------------------------------------
+%% @private
 %% @doc Sends the 2-step registration handshake to em_disco.
 %%
 %% Both frames are always sent:
@@ -311,6 +341,8 @@ gun_opts(tcp, _Host) ->
 %% its registry and the agent will not receive any queries.
 %% @end
 %%--------------------------------------------------------------------
+-spec register_on_disco(pid(), reference(), atom(), map(), string(),
+                        inet:port_number()) -> ok.
 register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
     gun:ws_send(ConnPid, StreamRef,
         {text, json:encode(#{
@@ -324,6 +356,7 @@ register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
             <<"capabilities">> => Caps
         })}).
 
+%% @private
 -spec dispatch(binary(), #state{}) -> {term(), #state{}}.
 dispatch(Body, #state{handler_module = Mod,
                       agent_name     = Name,
@@ -339,11 +372,13 @@ dispatch(Body, #state{handler_module = Mod,
     persist_memory(Table, NewMemory),
     {Result, State#state{memory = NewMemory}}.
 
+%% @private
 -spec persist_memory(atom() | undefined, map()) -> ok.
 persist_memory(undefined, _Memory) -> ok;
 persist_memory(Table, Memory)      ->
     ets:insert(Table, {memory, Memory}), ok.
 
+%% @private
 -spec init_memory(atom(), map()) -> {map(), atom() | undefined}.
 init_memory(AgentName, #{memory := ets}) ->
     Table  = list_to_atom(atom_to_list(AgentName) ++ "_memory"),
@@ -356,6 +391,7 @@ init_memory(AgentName, #{memory := ets}) ->
 init_memory(_AgentName, _Config) ->
     {#{}, undefined}.
 
+%% @private
 -spec resolve_token(map()) -> binary() | undefined.
 resolve_token(Config) ->
     case maps:get(jwt_token, Config, undefined) of
@@ -364,27 +400,33 @@ resolve_token(Config) ->
         T -> T
     end.
 
+%% @private
 -spec ws_path(binary() | undefined) -> string().
 ws_path(undefined)                   -> "/ws";
 ws_path(Token) when is_binary(Token) ->
     binary_to_list(<<"/ws?token=", Token/binary>>).
 
+%% @private
 -spec schedule_reconnect() -> reference().
 schedule_reconnect() ->
     erlang:send_after(reconnect_delay(), self(), connect).
 
+%% @private
 -spec safe_close(pid() | undefined) -> ok.
 safe_close(undefined) -> ok;
 safe_close(Pid)       -> gun:close(Pid), ok.
 
+%% @private
 -spec connect_timeout() -> pos_integer().
 connect_timeout() ->
     application:get_env(em_filter, connect_timeout_ms, 5000).
 
+%% @private
 -spec upgrade_timeout() -> pos_integer().
 upgrade_timeout() ->
     application:get_env(em_filter, upgrade_timeout_ms, 5000).
 
+%% @private
 -spec reconnect_delay() -> pos_integer().
 reconnect_delay() ->
     application:get_env(em_filter, reconnect_interval_ms, 5000).

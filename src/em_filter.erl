@@ -82,6 +82,13 @@ stop_agent(AgentName) ->
 %% HTML utilities
 %%====================================================================
 
+%%--------------------------------------------------------------------
+%% @doc Removes all `<script>...</script>' blocks from an HTML binary.
+%%
+%% Returns `{ok, Cleaned}' or `{error, cleaning_failed}' if the regex
+%% operation raises an exception.
+%% @end
+%%--------------------------------------------------------------------
 -spec strip_scripts(binary() | string()) ->
     {ok, binary()} | {error, cleaning_failed}.
 strip_scripts(Html) when is_list(Html) ->
@@ -91,10 +98,18 @@ strip_scripts(Html) when is_binary(Html) ->
         {ok, re:replace(Html, "<script[^>]*>.*?</script>", "",
                         [global, dotall, {return, binary}])}
     catch _:R ->
-        logger:error("[em_filter] strip_scripts failed: ~p", [R]),
+        logger:error("strip_scripts failed", #{reason => R}),
         {error, cleaning_failed}
     end.
 
+%%--------------------------------------------------------------------
+%% @doc Extracts HTML elements matching a CSS-style selector.
+%%
+%% Supported selectors: `li.b_algo', `div a', `div p',
+%% `.algoSlug_icon', `.news_dt', tag, `.class', `#id',
+%% `tag.class', `[attr=value]'.
+%% @end
+%%--------------------------------------------------------------------
 -spec extract_elements(binary(), string()) -> term().
 extract_elements(Html, Selector) ->
     case Selector of
@@ -118,10 +133,20 @@ extract_elements(Html, Selector) ->
             generic_selector(Html, Selector)
     end.
 
+%%--------------------------------------------------------------------
+%% @doc Strips all HTML tags from a binary, returning plain text.
+%% @end
+%%--------------------------------------------------------------------
 -spec get_text(binary()) -> binary().
 get_text(E) ->
     re:replace(E, ?PAT_TAGS, "", [global, {return, binary}]).
 
+%%--------------------------------------------------------------------
+%% @doc Extracts the value of an attribute from an HTML element binary.
+%%
+%% Returns `{ok, Value}' or `error' if the attribute is absent.
+%% @end
+%%--------------------------------------------------------------------
 -spec extract_attribute(binary(), string()) -> {ok, binary()} | error.
 extract_attribute(E, Attr) ->
     case re:run(E, Attr ++ "=['\"]([^'\"]*)['\"]",
@@ -130,6 +155,13 @@ extract_attribute(E, Attr) ->
         _            -> error
     end.
 
+%%--------------------------------------------------------------------
+%% @doc Strips noise strings and decodes HTML entities from text.
+%%
+%% Removes `D', `I', and `Dt' substrings then calls
+%% `decode_html_entities/1'.
+%% @end
+%%--------------------------------------------------------------------
 -spec clean_text(term(), term(), term()) -> binary().
 clean_text(D, I, Dt) ->
     T1 = safe_binary_replace(ensure_binary(D), ensure_binary(I), <<>>),
@@ -149,6 +181,10 @@ safe_binary_replace(S, P, R) ->
         end
     catch _:_ -> S end.
 
+%%--------------------------------------------------------------------
+%% @doc Decodes `&#N;', `&#xHH;', and `&name;' HTML entities.
+%% @end
+%%--------------------------------------------------------------------
 -spec decode_html_entities(binary()) -> binary().
 decode_html_entities(T) ->
     decode_named_entities(decode_hex_entities(decode_numeric_entities(T))).
@@ -210,6 +246,11 @@ resolve_named_entity(<<"ugrave">>) -> <<249/utf8>>;
 resolve_named_entity(<<"aacute">>) -> <<225/utf8>>;
 resolve_named_entity(_)            -> undefined.
 
+%%--------------------------------------------------------------------
+%% @doc Returns true if the link matches any excluded pattern or does
+%% not start with `http'.
+%% @end
+%%--------------------------------------------------------------------
 -spec should_skip_link(binary(), [string()]) -> boolean().
 should_skip_link(Link, Excluded) ->
     lists:any(fun(E) ->
@@ -221,6 +262,7 @@ should_skip_link(Link, Excluded) ->
 %% Private helpers
 %%====================================================================
 
+%% @private
 generic_selector(Html, Selector) ->
     case parse_sel(Selector) of
         {tag, Tag} ->
@@ -245,6 +287,7 @@ generic_selector(Html, Selector) ->
             {match, []}
     end.
 
+%% @private
 parse_sel([$# | Id])    -> {id, Id};
 parse_sel([$. | Class]) -> {class_only, Class};
 parse_sel([$[ | Rest]) ->
