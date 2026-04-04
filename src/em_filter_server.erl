@@ -5,26 +5,35 @@
 %%% Manages a single persistent WebSocket connection to ONE em_disco
 %%% node. em_filter_sup starts one server per configured disco node.
 %%%
-%%% Transport is determined by em_filter_sup:read_disco_nodes/0:
-%%%   tcp — plain WebSocket  (ws://)
-%%%   tls — TLS  WebSocket  (wss://)
+%%% === Connection lifecycle ===
 %%%
-%%% TLS uses verify_peer with the system CA store and sets SNI to the
-%%% target host dynamically so wildcard certificates (*.roques.me) are
-%%% accepted correctly by the Erlang SSL stack.
+%%% 1. `init/1' sends `self() ! connect' and returns immediately.
+%%% 2. `handle_info(connect, ...)' opens a Gun connection, upgrades to
+%%%    WebSocket and completes the 2-step handshake.
+%%% 3. On connection loss, a reconnect is scheduled after
+%%%    `reconnect_interval_ms' milliseconds (application env).
 %%%
-%%% === Startup sequence ===
+%%% The server process never stops due to transient network failures —
+%%% reconnection is handled internally. ETS memory (if configured)
+%%% survives reconnects because it is owned by the server process.
 %%%
-%%%   1. Open a Gun connection (tcp or tls) to the disco address.
-%%%   2. Upgrade to WebSocket on /ws.
-%%%   3. Send a register frame to announce the agent name.
-%%%   4. Send an agent_hello frame with capabilities (if any).
-%%%   5. Initialise the memory backend.
+%%% === Authentication ===
 %%%
-%%% === Reconnection ===
+%%% em_disco requires a JWT passed as `?token=<jwt>' in the WebSocket
+%%% upgrade URL. The token is read from (in order of priority):
+%%%   1. `jwt_token' key in the agent Config map
+%%%   2. `jwt_token' application env in the `em_filter' application
 %%%
-%%% On WS close or connection loss the gen_server stops and the
-%%% supervisor restarts it, which reconnects the agent to em_disco.
+%%% If no token is configured the upgrade will be rejected with 401;
+%%% the server logs a warning and schedules a reconnect.
+%%%
+%%% === Transport ===
+%%%
+%%% tcp — plain WebSocket  (ws://)
+%%% tls — TLS  WebSocket  (wss://)
+%%%
+%%% TLS uses verify_peer with the system CA store. SNI is set to the
+%%% target host so wildcard certificates are validated correctly.
 %%%
 %%% @author Steve Roques
 %%% @end
@@ -32,21 +41,23 @@
 -module(em_filter_server).
 -behaviour(gen_server).
 
--export([start_link/4]).
+-export([start_link/5]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -record(state, {
-    agent_name     :: atom(),
-    handler_module :: module(),
-    conn_pid       :: pid(),
-    stream_ref     :: reference(),
-    memory         :: map(),
-    memory_table   :: atom() | undefined
+    agent_name      :: atom(),
+    handler_module  :: module(),
+    config          :: map(),
+    host            :: string(),
+    port            :: inet:port_number(),
+    transport       :: tcp | tls,
+    conn_pid        :: pid() | undefined,
+    stream_ref      :: reference() | undefined,
+    memory          :: map(),
+    memory_table    :: atom() | undefined,
+    reconnect_timer :: reference() | undefined
 }).
-
--define(CONNECT_TIMEOUT, 5000).
--define(UPGRADE_TIMEOUT, 5000).
 
 %%====================================================================
 %% Public API
@@ -55,22 +66,20 @@
 %%--------------------------------------------------------------------
 %% @doc Starts a server linked to one specific disco node.
 %%
-%% The server name encodes host + port so multiple workers for the
-%% same agent have distinct registered names:
-%%   rss_filter_localhost_8080_server
-%%   rss_filter_em_disco_roques_me_443_server
+%% Index controls the registered process name:
+%%   1       → `<agent>_server'
+%%   2, 3, … → `<agent>_server_<N>'
+%%
+%% This ensures `whereis(my_agent_server)' works for the common
+%% single-node case while still supporting multi-node setups.
 %% @end
 %%--------------------------------------------------------------------
 -spec start_link(atom(), module(), map(),
-                 {string(), inet:port_number(), tcp | tls}) ->
+                 {string(), inet:port_number(), tcp | tls},
+                 pos_integer()) ->
     {ok, pid()} | {error, term()}.
-start_link(AgentName, HandlerModule, Config, {Host, Port, Transport}) ->
-    SafeHost   = re:replace(Host, "[^a-zA-Z0-9]", "_",
-                            [global, {return, list}]),
-    ServerName = list_to_atom(atom_to_list(AgentName)
-                              ++ "_" ++ SafeHost
-                              ++ "_" ++ integer_to_list(Port)
-                              ++ "_server"),
+start_link(AgentName, HandlerModule, Config, {Host, Port, Transport}, Index) ->
+    ServerName = server_name(AgentName, Index),
     gen_server:start_link({local, ServerName}, ?MODULE,
                           {AgentName, HandlerModule, Config,
                            Host, Port, Transport}, []).
@@ -80,44 +89,33 @@ start_link(AgentName, HandlerModule, Config, {Host, Port, Transport}) ->
 %%====================================================================
 
 init({AgentName, HandlerModule, Config, Host, Port, Transport}) ->
-    %% Pass Host to gun_opts so SNI is set dynamically — required for
-    %% wildcard TLS certificates (e.g. *.roques.me).
-    GunOpts = gun_opts(Transport, Host),
-    {ok, ConnPid} = gun:open(Host, Port, GunOpts),
-    case gun:await_up(ConnPid, ?CONNECT_TIMEOUT) of
-        {ok, _} ->
-            StreamRef = gun:ws_upgrade(ConnPid, "/ws"),
-            receive
-                {gun_upgrade, ConnPid, StreamRef, [<<"websocket">>], _} ->
-                    register_on_disco(ConnPid, StreamRef, AgentName,
-                                      Config, Host, Port),
-                    {Memory, MemTable} = init_memory(AgentName, Config),
-                    {ok, #state{
-                        agent_name     = AgentName,
-                        handler_module = HandlerModule,
-                        conn_pid       = ConnPid,
-                        stream_ref     = StreamRef,
-                        memory         = Memory,
-                        memory_table   = MemTable
-                    }};
-                {gun_response, ConnPid, _, _, Status, _} ->
-                    gun:close(ConnPid),
-                    {stop, {ws_rejected, Status}};
-                {gun_error, ConnPid, StreamRef, Reason} ->
-                    gun:close(ConnPid),
-                    {stop, {ws_error, Reason}}
-            after ?UPGRADE_TIMEOUT ->
-                gun:close(ConnPid),
-                {stop, ws_timeout}
-            end;
-        {error, Reason} ->
-            gun:close(ConnPid),
-            {stop, {connect_failed, Reason}}
-    end.
+    {Memory, MemTable} = init_memory(AgentName, Config),
+    self() ! connect,
+    {ok, #state{
+        agent_name      = AgentName,
+        handler_module  = HandlerModule,
+        config          = Config,
+        host            = Host,
+        port            = Port,
+        transport       = Transport,
+        conn_pid        = undefined,
+        stream_ref      = undefined,
+        memory          = Memory,
+        memory_table    = MemTable,
+        reconnect_timer = undefined
+    }}.
 
+%%--------------------------------------------------------------------
+%% @doc Handles incoming WebSocket frames from em_disco.
+%%
+%% Only `query' frames are processed — registration ack frames
+%% (registered, agent_registered) are silently ignored.
+%% @end
+%%--------------------------------------------------------------------
 handle_info({gun_ws, _C, _S, {text, Data}}, State) ->
     case json:decode(Data) of
         #{<<"action">> := <<"query">>, <<"id">> := Id, <<"body">> := Body} ->
+            logger:notice("[em_filter] query: ~ts", [Body]),
             {Result, NewState} = dispatch(Body, State),
             gun:ws_send(State#state.conn_pid, State#state.stream_ref,
                 {text, json:encode(#{
@@ -127,30 +125,143 @@ handle_info({gun_ws, _C, _S, {text, Data}}, State) ->
                 })}),
             {noreply, NewState};
         _ ->
-            %% Ignore ack frames (registered, agent_registered).
             {noreply, State}
     end;
 
+%%--------------------------------------------------------------------
+%% @doc Attempts to open a Gun connection and upgrade to WebSocket.
+%%
+%% On any failure (connect error, upgrade timeout, 401, etc.) the
+%% server schedules another `connect' message after
+%% `reconnect_interval_ms' milliseconds.
+%% @end
+%%--------------------------------------------------------------------
+handle_info(connect, #state{conn_pid = P} = State) when P =/= undefined ->
+    %% Already connected — stale connect message, ignore.
+    {noreply, State};
+
+handle_info(connect, #state{host       = Host,
+                             port       = Port,
+                             transport  = Transport,
+                             agent_name = Name,
+                             config     = Config} = State) ->
+    GunOpts = gun_opts(Transport, Host),
+    case gun:open(Host, Port, GunOpts) of
+        {ok, ConnPid} ->
+            case gun:await_up(ConnPid, connect_timeout()) of
+                {ok, _} ->
+                    Token     = resolve_token(Config),
+                    Path      = ws_path(Token),
+                    StreamRef = gun:ws_upgrade(ConnPid, Path),
+                    receive
+                        {gun_upgrade, ConnPid, StreamRef,
+                         [<<"websocket">>], _} ->
+                            register_on_disco(ConnPid, StreamRef,
+                                              Name, Config, Host, Port),
+                            logger:info("Agent connected",
+                                #{agent => Name, host => Host, port => Port}),
+                            {noreply, State#state{
+                                conn_pid        = ConnPid,
+                                stream_ref      = StreamRef,
+                                reconnect_timer = undefined
+                            }};
+                        {gun_response, ConnPid, _, _, 401, _} ->
+                            gun:close(ConnPid),
+                            logger:warning("WS auth rejected (401)",
+                                #{agent => Name, host => Host, port => Port}),
+                            Ref = schedule_reconnect(),
+                            {noreply, State#state{
+                                conn_pid        = undefined,
+                                reconnect_timer = Ref
+                            }};
+                        {gun_response, ConnPid, _, _, Status, _} ->
+                            gun:close(ConnPid),
+                            logger:warning("WS upgrade rejected",
+                                #{agent => Name, status => Status}),
+                            Ref = schedule_reconnect(),
+                            {noreply, State#state{
+                                conn_pid        = undefined,
+                                reconnect_timer = Ref
+                            }};
+                        {gun_error, ConnPid, StreamRef, Reason} ->
+                            gun:close(ConnPid),
+                            logger:warning("WS upgrade error",
+                                #{agent => Name, reason => Reason}),
+                            Ref = schedule_reconnect(),
+                            {noreply, State#state{
+                                conn_pid        = undefined,
+                                reconnect_timer = Ref
+                            }}
+                    after upgrade_timeout() ->
+                        gun:close(ConnPid),
+                        logger:warning("WS upgrade timeout",
+                            #{agent => Name, host => Host, port => Port}),
+                        Ref = schedule_reconnect(),
+                        {noreply, State#state{
+                            conn_pid        = undefined,
+                            reconnect_timer = Ref
+                        }}
+                    end;
+                {error, Reason} ->
+                    gun:close(ConnPid),
+                    logger:warning("Connect failed",
+                        #{agent => Name, host => Host,
+                          port => Port, reason => Reason}),
+                    Ref = schedule_reconnect(),
+                    {noreply, State#state{
+                        conn_pid        = undefined,
+                        reconnect_timer = Ref
+                    }}
+            end;
+        {error, Reason} ->
+            logger:warning("gun:open failed",
+                #{agent => Name, host => Host, port => Port, reason => Reason}),
+            Ref = schedule_reconnect(),
+            {noreply, State#state{reconnect_timer = Ref}}
+    end;
+
+handle_info({gun_ws, C, _S, close}, #state{conn_pid = C} = State) ->
+    logger:warning("WS closed, scheduling reconnect",
+                   #{agent => State#state.agent_name}),
+    safe_close(C),
+    Ref = schedule_reconnect(),
+    {noreply, State#state{conn_pid        = undefined,
+                          stream_ref      = undefined,
+                          reconnect_timer = Ref}};
 handle_info({gun_ws, _C, _S, close}, State) ->
-    logger:warning("[em_filter] ~s: WS closed, reconnecting...",
-                   [State#state.agent_name]),
-    {stop, ws_closed, State};
+    %% Stale close from a previous connection, ignore.
+    {noreply, State};
 
-handle_info({gun_down, _C, _P, Reason, _}, State) ->
-    logger:warning("[em_filter] ~s: disco unreachable (~p), reconnecting...",
-                   [State#state.agent_name, Reason]),
-    {stop, {disco_down, Reason}, State};
+handle_info({gun_down, C, _P, Reason, _}, #state{conn_pid = C} = State) ->
+    logger:warning("Disco unreachable, scheduling reconnect",
+                   #{agent => State#state.agent_name, reason => Reason}),
+    safe_close(C),
+    Ref = schedule_reconnect(),
+    {noreply, State#state{conn_pid        = undefined,
+                          stream_ref      = undefined,
+                          reconnect_timer = Ref}};
+handle_info({gun_down, _C, _P, _Reason, _}, State) ->
+    %% Stale gun_down from a previous connection, ignore.
+    {noreply, State};
 
-handle_info(_Info, State)       -> {noreply, State}.
+handle_info(_Info, State) ->
+    {noreply, State}.
+
 handle_call(_Req, _From, State) -> {reply, ok, State}.
 handle_cast(_Msg, State)        -> {noreply, State}.
 
-terminate(_Reason, #state{conn_pid = Pid, memory_table = Table}) ->
+terminate(_Reason, #state{conn_pid        = ConnPid,
+                           memory_table   = Table,
+                           reconnect_timer = Timer}) ->
+    case Timer of
+        undefined -> ok;
+        R         -> erlang:cancel_timer(R)
+    end,
+    safe_close(ConnPid),
     case Table of
         undefined -> ok;
         T         -> catch ets:delete(T)
-    end,
-    gun:close(Pid).
+    end.
 
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
@@ -158,13 +269,18 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% Internal helpers
 %%====================================================================
 
+-spec server_name(atom(), pos_integer()) -> atom().
+server_name(AgentName, 1) ->
+    list_to_atom(atom_to_list(AgentName) ++ "_server");
+server_name(AgentName, N) ->
+    list_to_atom(atom_to_list(AgentName) ++ "_server_" ++ integer_to_list(N)).
+
 %%--------------------------------------------------------------------
-%% @private
-%% @doc Builds Gun options for the given transport.
+%% @doc Builds Gun transport options.
 %%
-%% tcp — plain connection, no TLS.
-%% tls — TLS with system CA store and SNI set to Host so wildcard
-%%       certificates (e.g. *.roques.me) are validated correctly.
+%% tcp — plain connection.
+%% tls — TLS with system CA store. SNI set to Host so wildcard
+%%       certificates are validated correctly.
 %% @end
 %%--------------------------------------------------------------------
 -spec gun_opts(tcp | tls, string()) -> map().
@@ -184,25 +300,29 @@ gun_opts(tls, Host) ->
 gun_opts(tcp, _Host) ->
     #{protocols => [http]}.
 
+%%--------------------------------------------------------------------
+%% @doc Sends the 2-step registration handshake to em_disco.
+%%
+%% Both frames are always sent:
+%%   1. `register'    — announces the agent name.
+%%   2. `agent_hello' — announces capabilities (may be empty list).
+%%
+%% Without `agent_hello', em_disco does not insert the agent into
+%% its registry and the agent will not receive any queries.
+%% @end
+%%--------------------------------------------------------------------
 register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
     gun:ws_send(ConnPid, StreamRef,
         {text, json:encode(#{
             <<"action">> => <<"register">>,
             <<"name">>   => atom_to_binary(AgentName, utf8)
         })}),
-    logger:info("[em_filter] ~s registered on disco ~s:~p",
-                [AgentName, Host, Port]),
-    case maps:get(capabilities, Config, []) of
-        [] -> ok;
-        Caps ->
-            gun:ws_send(ConnPid, StreamRef,
-                {text, json:encode(#{
-                    <<"action">>       => <<"agent_hello">>,
-                    <<"capabilities">> => Caps
-                })}),
-            logger:info("[em_filter] ~s agent_hello caps=~p",
-                        [AgentName, Caps])
-    end.
+    Caps = maps:get(capabilities, Config, []),
+    gun:ws_send(ConnPid, StreamRef,
+        {text, json:encode(#{
+            <<"action">>       => <<"agent_hello">>,
+            <<"capabilities">> => Caps
+        })}).
 
 -spec dispatch(binary(), #state{}) -> {term(), #state{}}.
 dispatch(Body, #state{handler_module = Mod,
@@ -212,7 +332,8 @@ dispatch(Body, #state{handler_module = Mod,
     {Result, NewMemory} = try
         Mod:handle(Body, Memory)
     catch E:R ->
-        logger:error("[em_filter] ~s handler error ~p:~p", [Name, E, R]),
+        logger:error("Handler error",
+                     #{agent => Name, class => E, reason => R}),
         {json:encode(#{<<"error">> => <<"handler_failed">>}), Memory}
     end,
     persist_memory(Table, NewMemory),
@@ -234,3 +355,36 @@ init_memory(AgentName, #{memory := ets}) ->
     {Memory, Table};
 init_memory(_AgentName, _Config) ->
     {#{}, undefined}.
+
+-spec resolve_token(map()) -> binary() | undefined.
+resolve_token(Config) ->
+    case maps:get(jwt_token, Config, undefined) of
+        undefined ->
+            application:get_env(em_filter, jwt_token, undefined);
+        T -> T
+    end.
+
+-spec ws_path(binary() | undefined) -> string().
+ws_path(undefined)                   -> "/ws";
+ws_path(Token) when is_binary(Token) ->
+    binary_to_list(<<"/ws?token=", Token/binary>>).
+
+-spec schedule_reconnect() -> reference().
+schedule_reconnect() ->
+    erlang:send_after(reconnect_delay(), self(), connect).
+
+-spec safe_close(pid() | undefined) -> ok.
+safe_close(undefined) -> ok;
+safe_close(Pid)       -> gun:close(Pid), ok.
+
+-spec connect_timeout() -> pos_integer().
+connect_timeout() ->
+    application:get_env(em_filter, connect_timeout_ms, 5000).
+
+-spec upgrade_timeout() -> pos_integer().
+upgrade_timeout() ->
+    application:get_env(em_filter, upgrade_timeout_ms, 5000).
+
+-spec reconnect_delay() -> pos_integer().
+reconnect_delay() ->
+    application:get_env(em_filter, reconnect_interval_ms, 5000).

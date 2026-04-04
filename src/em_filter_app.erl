@@ -27,6 +27,8 @@
 %% @end
 %%--------------------------------------------------------------------
 start(_StartType, _StartArgs) ->
+    logger:add_primary_filter(no_progress,
+        {fun logger_filters:progress/2, stop}),
     em_filter_sup:start_link().
 
 %%--------------------------------------------------------------------
