@@ -167,7 +167,7 @@ handle_info(connect, #state{host       = Host,
                         {gun_upgrade, ConnPid, StreamRef,
                          [<<"websocket">>], _} ->
                             register_on_disco(ConnPid, StreamRef,
-                                              Name, Config, Host, Port),
+                                              Name, Config),
                             logger:notice("[em_filter] agent connected: ~ts @ ~s:~p",
                                 [Name, Host, Port]),
                             {noreply, State#state{
@@ -341,9 +341,8 @@ gun_opts(tcp, _Host) ->
 %% its registry and the agent will not receive any queries.
 %% @end
 %%--------------------------------------------------------------------
--spec register_on_disco(pid(), reference(), atom(), map(), string(),
-                        inet:port_number()) -> ok.
-register_on_disco(ConnPid, StreamRef, AgentName, Config, Host, Port) ->
+-spec register_on_disco(pid(), reference(), atom(), map()) -> ok.
+register_on_disco(ConnPid, StreamRef, AgentName, Config) ->
     gun:ws_send(ConnPid, StreamRef,
         {text, json:encode(#{
             <<"action">> => <<"register">>,
