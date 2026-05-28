@@ -33,6 +33,16 @@
 
 -export([start_agent/3, stop_agent/1, base_capabilities/0]).
 
+%% Population Protocol peer discovery
+-export([
+    pop_node/1,
+    pop_peers/1,
+    pop_peers_for/3,
+    pop_trust/2,
+    pop_gossip/1,
+    pop_vector/1
+]).
+
 -export([
     strip_scripts/1,
     extract_elements/2,
@@ -77,6 +87,86 @@ start_agent(AgentName, HandlerModule, Config) ->
 -spec stop_agent(atom()) -> ok | {error, term()}.
 stop_agent(AgentName) ->
     em_filter_sup:stop_agent(AgentName).
+
+%%====================================================================
+%% Population Protocol peer discovery
+%%====================================================================
+
+%%--------------------------------------------------------------------
+%% @doc Return the em_pop node pid for an agent, or `undefined'.
+%%
+%% Returns `undefined' when the agent was started without a `pop_port'
+%% key in its Config map.
+%% @end
+%%--------------------------------------------------------------------
+-spec pop_node(atom()) -> pid() | undefined.
+pop_node(AgentName) ->
+    em_pop_sup:get_node(AgentName).
+
+%%--------------------------------------------------------------------
+%% @doc Return all Population Protocol peers known by an agent.
+%%
+%% Returns `[]' when the agent has no em_pop node.
+%% @end
+%%--------------------------------------------------------------------
+-spec pop_peers(atom()) -> [map()].
+pop_peers(AgentName) ->
+    case em_pop_sup:get_node(AgentName) of
+        undefined -> [];
+        Pid       -> em_pop_node:get_peers(Pid)
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Return the top-K PP peers ordered by cosine similarity.
+%%
+%% QueryVec must be an f32 little-endian binary of the same dimension
+%% as the vectors used when the agent was started (default: 64 floats).
+%% @end
+%%--------------------------------------------------------------------
+-spec pop_peers_for(atom(), QueryVec :: binary(), K :: pos_integer()) ->
+    [{map(), float()}].
+pop_peers_for(AgentName, QueryVec, K) ->
+    case em_pop_sup:get_node(AgentName) of
+        undefined -> [];
+        Pid       -> em_pop_node:peers_for(Pid, QueryVec, K)
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Return the PP trust score for a peer (0.0 = unknown, 1.0 = full).
+%% @end
+%%--------------------------------------------------------------------
+-spec pop_trust(atom(), PeerId :: binary()) -> float().
+pop_trust(AgentName, PeerId) ->
+    case em_pop_sup:get_node(AgentName) of
+        undefined -> 0.0;
+        Pid       -> em_pop_node:get_trust(Pid, PeerId)
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Trigger one synchronous gossip tick for an agent's PP node.
+%%
+%% Returns `{error, no_pop_node}' when the agent has no em_pop node.
+%% @end
+%%--------------------------------------------------------------------
+-spec pop_gossip(atom()) -> ok | {error, no_pop_node}.
+pop_gossip(AgentName) ->
+    case em_pop_sup:get_node(AgentName) of
+        undefined -> {error, no_pop_node};
+        Pid       -> em_pop_node:gossip_tick(Pid)
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Return the capability vector used by an agent's PP node.
+%%
+%% Useful for building QueryVec arguments to pop_peers_for/3.
+%% @end
+%%--------------------------------------------------------------------
+-spec pop_vector(atom()) -> binary() | undefined.
+pop_vector(AgentName) ->
+    case em_pop_sup:get_node(AgentName) of
+        undefined -> undefined;
+        Pid       -> em_pop_node:get_vector(Pid)
+    end.
 
 %%====================================================================
 %% HTML utilities
