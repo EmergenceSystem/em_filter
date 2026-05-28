@@ -383,9 +383,10 @@ dispatch(Body, #state{handler_module = Mod,
                       memory         = Memory,
                       memory_table   = Table} = State) ->
     case (try {ok, Mod:handle(Body, Memory)}
-          catch E:R ->
+          catch E:R:Stack ->
               logger:error("Handler error",
-                           #{agent => Name, class => E, reason => R}),
+                           #{agent => Name, class => E, reason => R,
+                             stacktrace => Stack}),
               error
           end) of
         {ok, {Result, NewMemory}} ->
