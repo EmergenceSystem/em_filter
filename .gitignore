@@ -48,3 +48,6 @@ erl_crash.dump
 
 Mnesia.nonode@nohost/
 mnesia_test_data/
+
+# Superpowers docs (specs, plans) — kept locally, not in the repo
+docs/
