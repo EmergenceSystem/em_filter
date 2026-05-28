@@ -251,7 +251,12 @@ init(Opts) ->
         undefined ->
             {undefined, #{}, Ix};
         Dir ->
-            SName = list_to_atom("em_pop_" ++ binary_to_list(Name)),
+            NameStr = if
+                is_binary(Name) -> binary_to_list(Name);
+                is_list(Name)   -> Name;
+                is_atom(Name)   -> atom_to_list(Name)
+            end,
+            SName = list_to_atom("em_pop_" ++ NameStr),
             case em_pop_store:open(SName, Dir) of
                 {ok, _} ->
                     Saved = em_pop_store:load(SName),
@@ -263,7 +268,11 @@ init(Opts) ->
                     end, Saved),
                     %% Rebuild kvex index from restored peers.
                     maps:foreach(fun(PId, #peer{vector = V}) ->
-                        kvex:add(Ix, PId, V)
+                        case kvex:add(Ix, PId, V) of
+                            ok  -> ok;
+                            Err -> ?LOG_WARNING("em_pop kvex restore failed peer=~s err=~p",
+                                                [short_id(PId), Err])
+                        end
                     end, Fresh),
                     {SName, Fresh, Ix};
                 {error, Reason} ->
@@ -436,7 +445,11 @@ handle_info(gossip_timer, #state{gossip_interval = I,
     %% table is available for the next startup restore.
     case Store of
         undefined -> ok;
-        _         -> em_pop_store:save(Store, Peers)
+        _ ->
+            case em_pop_store:save(Store, Peers) of
+                ok  -> ok;
+                Err -> ?LOG_WARNING("em_pop DETS save failed: ~p", [Err])
+            end
     end,
     case map_size(Peers) of
         0 ->
