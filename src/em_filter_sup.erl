@@ -31,10 +31,12 @@
 %%% === em_pop Config keys ===
 %%%
 %%%   pop_port            => pos_integer()   — required to enable em_pop
-%%%   pop_peers           => [{Host, Port}]  — bootstrap peers (optional)
+%%%   pop_peers           => [{Host, Port}]  — bootstrap peers + auto-repair seeds (optional)
 %%%   pop_stale_timeout   => pos_integer()   — default 30 000 ms
 %%%   pop_gossip_interval => pos_integer()   — default  5 000 ms (0=off)
 %%%   pop_max_peers       => pos_integer()   — default 200
+%%%   pop_persist_dir     => string()        — DETS directory; absent = no persistence
+%%%   pop_evict_threshold => float()         — trust floor for immediate eviction; default 0.0
 %%%
 %%% @author Steve Roques
 %%% @end
@@ -186,28 +188,28 @@ maybe_start_pop_node(AgentName, Config) ->
             ok;
         Port ->
             %% Derive the capability vector from the agent's capabilities.
-            Caps = maps:get(capabilities, Config, []),
-            Vec  = em_filter_vec:from_capabilities(Caps),
+            Caps  = maps:get(capabilities, Config, []),
+            Vec   = em_filter_vec:from_capabilities(Caps),
+            Seeds = maps:get(pop_peers, Config, []),  %% dual role: bootstrap + repair seeds
 
             PopOpts = #{
                 port            => Port,
                 vector          => Vec,
-                stale_timeout   => maps:get(pop_stale_timeout,
-                                            Config, 30_000),
-                gossip_interval => maps:get(pop_gossip_interval,
-                                            Config,  5_000),
-                max_peers       => maps:get(pop_max_peers,
-                                            Config,    200)
+                seeds           => Seeds,
+                evict_threshold => maps:get(pop_evict_threshold, Config, 0.0),
+                persist_dir     => maps:get(pop_persist_dir,     Config, undefined),
+                stale_timeout   => maps:get(pop_stale_timeout,   Config, 30_000),
+                gossip_interval => maps:get(pop_gossip_interval, Config,  5_000),
+                max_peers       => maps:get(pop_max_peers,        Config,    200)
             },
             case em_pop_sup:start_node(AgentName, PopOpts) of
                 {ok, Pid} ->
-                    %% Contact bootstrap peers to seed the peer table.
+                    %% Bootstrap: contact each seed immediately on startup.
                     %% Errors are caught so a dead bootstrap does not
                     %% prevent the agent from starting.
-                    Peers = maps:get(pop_peers, Config, []),
                     lists:foreach(fun({H, P}) ->
                         catch em_pop_node:add_peer(Pid, H, P)
-                    end, Peers),
+                    end, Seeds),
                     {ok, Pid};
                 Error ->
                     logger:warning("[em_filter] em_pop start failed",

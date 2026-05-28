@@ -22,7 +22,8 @@
         em_filter_vec,
         em_pop_sup,
         em_pop_node,
-        em_pop_http
+        em_pop_http,
+        em_pop_store
     ]},
     {licenses, ["Apache-2.0"]},
     {links, [{"GitHub", "https://github.com/EmergenceSystem/em_filter"}]}
