@@ -2,13 +2,18 @@
 %%% @doc
 %%% em_filter Top-Level Supervisor
 %%%
-%%% Manages a dynamic pool of `em_filter_server' workers using a
-%%% `simple_one_for_one' strategy.
+%%% Manages the em_filter_server worker pool and the em_pop Population
+%%% Protocol sub-supervisor.
 %%%
-%%% When `start_agent/3' is called, one worker is started per
-%%% configured disco node. An agent automatically connects to every
-%%% node listed in the `disco_nodes' agent config key or discovered
-%%% via environment variables and emergence.conf.
+%%% Strategy: `one_for_one'.
+%%%   • em_pop_sup  — permanent child, started at application boot.
+%%%   • em_filter_server workers — added dynamically via start_agent/3,
+%%%     each with its own unique child id.
+%%%
+%%% When `start_agent/3' is called, one em_filter_server worker is
+%%% started per configured disco node.  If the Config map contains a
+%%% `pop_port' key, an em_pop Population Protocol node is also started
+%%% and registered in em_pop_sup's ETS registry.
 %%%
 %%% === Node format in emergence.conf ===
 %%%
@@ -22,6 +27,14 @@
 %%%   localhost:9000         → 9000, plain TCP
 %%%   example.com:8080       → 8080, plain TCP
 %%%   example.com:443        → 443,  TLS
+%%%
+%%% === em_pop Config keys ===
+%%%
+%%%   pop_port            => pos_integer()   — required to enable em_pop
+%%%   pop_peers           => [{Host, Port}]  — bootstrap peers (optional)
+%%%   pop_stale_timeout   => pos_integer()   — default 30 000 ms
+%%%   pop_gossip_interval => pos_integer()   — default  5 000 ms (0=off)
+%%%   pop_max_peers       => pos_integer()   — default 200
 %%%
 %%% @author Steve Roques
 %%% @end
@@ -44,12 +57,14 @@ start_link() ->
 %%   3. `[em_disco] nodes = ...' in emergence.conf
 %%   4. Default: [{"localhost", 8080, tcp}]
 %%
+%% If Config contains `pop_port', an em_pop node is also started and
+%% the capability vector is derived from the `capabilities' list.
+%%
 %% Returns `{ok, Pid}' of the first successfully started worker.
 %%
 %% @param AgentName     Unique atom identifying the agent.
 %% @param HandlerModule Module exporting handle/2.
-%% @param Config        Agent options map (capabilities, memory,
-%%                      jwt_token, disco_nodes).
+%% @param Config        Agent options map.
 %% @end
 %%--------------------------------------------------------------------
 -spec start_agent(atom(), module(), map()) ->
@@ -58,13 +73,24 @@ start_agent(AgentName, HandlerModule, Config) ->
     Nodes        = resolve_nodes(Config),
     IndexedNodes = lists:zip(lists:seq(1, length(Nodes)), Nodes),
     Results      = lists:map(fun({Idx, Node}) ->
-        supervisor:start_child(?MODULE,
-                               [AgentName, HandlerModule, Config, Node, Idx])
+        ChildId   = {em_filter_server, AgentName, Idx},
+        ChildSpec = #{
+            id       => ChildId,
+            start    => {em_filter_server, start_link,
+                         [AgentName, HandlerModule, Config, Node, Idx]},
+            restart  => transient,
+            shutdown => 5000,
+            type     => worker,
+            modules  => [em_filter_server]
+        },
+        supervisor:start_child(?MODULE, ChildSpec)
     end, IndexedNodes),
+    _ = maybe_start_pop_node(AgentName, Config),
+    _ = maybe_start_query_listener(AgentName, Config),
     first_ok(Results).
 
 %%--------------------------------------------------------------------
-%% @doc Stops all workers for the given agent name.
+%% @doc Stops all workers and the em_pop node for the given agent.
 %%
 %% Returns `{error, not_running}' if no matching worker is found.
 %% @end
@@ -73,13 +99,13 @@ start_agent(AgentName, HandlerModule, Config) ->
 stop_agent(AgentName) ->
     Prefix   = atom_to_list(AgentName) ++ "_server",
     Children = supervisor:which_children(?MODULE),
-    Matching = lists:filtermap(fun({_, Pid, _, _}) ->
+    Matching = lists:filtermap(fun({ChildId, Pid, _, _}) ->
         case Pid of
             P when is_pid(P) ->
                 case process_info(P, registered_name) of
                     {registered_name, Name} ->
                         case is_agent_server(atom_to_list(Name), Prefix) of
-                            true  -> {true, P};
+                            true  -> {true, ChildId};
                             false -> false
                         end;
                     _ -> false
@@ -90,28 +116,150 @@ stop_agent(AgentName) ->
     case Matching of
         [] ->
             {error, not_running};
-        Pids ->
-            lists:foreach(fun(P) ->
-                supervisor:terminate_child(?MODULE, P)
-            end, Pids),
+        Ids ->
+            lists:foreach(fun(Id) ->
+                supervisor:terminate_child(?MODULE, Id),
+                supervisor:delete_child(?MODULE, Id)
+            end, Ids),
+            em_pop_sup:stop_node(AgentName),
+            catch cowboy:stop_listener({em_filter_query, AgentName}),
             ok
     end.
 
+%%--------------------------------------------------------------------
 %% @private
+%% @doc Supervisor init — one_for_one with em_pop_sup as permanent child.
+%%
+%% em_pop_sup is always started at boot so its ETS registry is ready
+%% before any `start_agent/3' call arrives.
+%%
+%% em_filter_server workers are added dynamically by `start_agent/3'
+%% using full child specs (required by the one_for_one strategy).
+%% They are not listed here.
+%% @end
+%%--------------------------------------------------------------------
 -spec init([]) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
 init([]) ->
-    Child = #{
-        id       => em_filter_server,
-        start    => {em_filter_server, start_link, []},
-        restart  => permanent,
+    PopSup = #{
+        id       => em_pop_sup,
+        start    => {em_pop_sup, start_link, []},
+        restart  => permanent,         %% always restart if it crashes
         shutdown => 5000,
-        type     => worker,
-        modules  => [em_filter_server]
+        type     => supervisor,
+        modules  => [em_pop_sup]
     },
-    {ok, {#{strategy  => simple_one_for_one,
-            intensity => 10,
-            period    => 60},
-          [Child]}}.
+    {ok, {#{strategy  => one_for_one,
+            intensity => 10,           %% max 10 restarts …
+            period    => 60},          %% … in any 60-second window
+          [PopSup]}}.                  %% workers added dynamically
+
+%%====================================================================
+%% em_pop integration
+%%====================================================================
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Optionally start an em_pop Population Protocol node for an agent.
+%%
+%% Only starts a node when the Config map contains a `pop_port' key.
+%% Agents without `pop_port' continue to work exactly as before — this
+%% function is a no-op for them (graceful degradation).
+%%
+%% Steps when `pop_port' is present:
+%%   1. Derive a semantic capability vector from the `capabilities'
+%%      list using `em_filter_vec:from_capabilities/1'.  The vector is
+%%      deterministic: same capabilities always produce the same vector.
+%%   2. Start an em_pop_node via em_pop_sup, which also registers it in
+%%      the ETS table under AgentName.
+%%   3. Contact each `pop_peers' bootstrap peer (if any) to seed the
+%%      peer table and trigger the first gossip exchange.
+%%
+%% Bootstrap failures are caught and logged — they do not prevent the
+%% agent from starting.
+%% @end
+%%--------------------------------------------------------------------
+-spec maybe_start_pop_node(atom(), map()) -> ok | {ok, pid()}.
+maybe_start_pop_node(AgentName, Config) ->
+    case maps:get(pop_port, Config, undefined) of
+        undefined ->
+            %% No pop_port — em_pop is not enabled for this agent.
+            ok;
+        Port ->
+            %% Derive the capability vector from the agent's capabilities.
+            Caps = maps:get(capabilities, Config, []),
+            Vec  = em_filter_vec:from_capabilities(Caps),
+
+            PopOpts = #{
+                port            => Port,
+                vector          => Vec,
+                stale_timeout   => maps:get(pop_stale_timeout,
+                                            Config, 30_000),
+                gossip_interval => maps:get(pop_gossip_interval,
+                                            Config,  5_000),
+                max_peers       => maps:get(pop_max_peers,
+                                            Config,    200)
+            },
+            case em_pop_sup:start_node(AgentName, PopOpts) of
+                {ok, Pid} ->
+                    %% Contact bootstrap peers to seed the peer table.
+                    %% Errors are caught so a dead bootstrap does not
+                    %% prevent the agent from starting.
+                    Peers = maps:get(pop_peers, Config, []),
+                    lists:foreach(fun({H, P}) ->
+                        catch em_pop_node:add_peer(Pid, H, P)
+                    end, Peers),
+                    {ok, Pid};
+                Error ->
+                    logger:warning("[em_filter] em_pop start failed",
+                                   #{agent => AgentName, error => Error}),
+                    ok
+            end
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Optionally start a Cowboy HTTP listener for direct query routing.
+%%
+%% Only starts when Config contains a `query_port' key.  Agents without
+%% this key are invisible to em_pop-based Emquest dispatch (they are
+%% still reachable via the WebSocket bus during Phase 2).
+%%
+%% Route:  POST /agent/query  → em_filter_http #{server => ServerAtom}
+%%
+%% ServerAtom is `<agent>_server' — the primary worker (index 1).
+%% All multi-node workers share the same query endpoint; the HTTP path
+%% is stateless so no routing between workers is needed.
+%%
+%% `already_started' is accepted silently so `start_agent/3' may be
+%% called again after a partial failure without crashing.  All other
+%% errors are logged but do not abort agent startup.
+%% @end
+%%--------------------------------------------------------------------
+-spec maybe_start_query_listener(atom(), map()) -> ok.
+maybe_start_query_listener(AgentName, Config) ->
+    case maps:get(query_port, Config, undefined) of
+        undefined ->
+            ok;
+        QPort ->
+            ServerAtom = list_to_atom(atom_to_list(AgentName) ++ "_server"),
+            Dispatch = cowboy_router:compile([
+                {'_', [{"/agent/query", em_filter_http,
+                        #{server => ServerAtom}}]}
+            ]),
+            ListenerRef = {em_filter_query, AgentName},
+            case cowboy:start_clear(ListenerRef, [{port, QPort}],
+                                    #{env => #{dispatch => Dispatch}}) of
+                {ok, _} ->
+                    logger:info("[em_filter] query listener on port ~w for ~p",
+                                [QPort, AgentName]);
+                {error, {already_started, _}} ->
+                    ok;
+                {error, Reason} ->
+                    logger:warning("[em_filter] query listener failed to start",
+                                   #{agent => AgentName, reason => Reason})
+            end,
+            ok
+    end.
 
 %%====================================================================
 %% Disco node resolution

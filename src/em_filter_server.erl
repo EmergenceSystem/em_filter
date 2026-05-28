@@ -258,11 +258,25 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 %%--------------------------------------------------------------------
-%% @doc No synchronous calls — returns `ok' for any request.
+%% @doc Handle a direct HTTP query forwarded by em_filter_http.
+%%
+%% Delegates to the same `dispatch/2' function used by the WebSocket
+%% path.  The agent's handler module and memory are therefore shared
+%% between both transports — the caller's transport is invisible to
+%% the handler.
+%%
+%% Returns `{ok, Result}' where Result is the JSON binary produced by
+%% `handler_module:handle/2'.  em_filter_http decodes this before
+%% embedding it in its response body.
 %% @end
 %%--------------------------------------------------------------------
--spec handle_call(term(), {pid(), term()}, #state{}) -> {reply, ok, #state{}}.
-handle_call(_Req, _From, State) -> {reply, ok, State}.
+-spec handle_call(term(), {pid(), term()}, #state{}) ->
+    {reply, {ok, binary()} | ok, #state{}}.
+handle_call({http_query, QueryBinary}, _From, State) ->
+    {Result, NewState} = dispatch(QueryBinary, State),
+    {reply, {ok, Result}, NewState};
+handle_call(_Req, _From, State) ->
+    {reply, ok, State}.
 
 %%--------------------------------------------------------------------
 %% @doc No asynchronous casts handled.
