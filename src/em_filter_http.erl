@@ -50,7 +50,7 @@
 %% @end
 %%--------------------------------------------------------------------
 init(Req0, #{server := ServerName} = State) ->
-    {ok, Body, Req1} = cowboy_req:read_body(Req0),
+    {ok, Body, Req1} = cowboy_req:read_body(Req0, #{length => 64_000, period => 5_000}),
     try
         #{<<"query">> := Query} = json:decode(Body),
         case gen_server:call(ServerName, {http_query, Query}, 30_000) of

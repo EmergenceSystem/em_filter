@@ -126,12 +126,16 @@ handle_info({gun_ws, _C, _S, {text, Data}}, State) ->
     case json:decode(Data) of
         #{<<"action">> := <<"query">>, <<"id">> := Id, <<"body">> := Body} ->
             logger:notice("[em_filter] query: ~ts", [Body]),
-            {Result, NewState} = dispatch(Body, State),
+            {ResultToSend, NewState} = case dispatch(Body, State) of
+                {ok, R, S}    -> {R, S};
+                {error, _, S} ->
+                    {json:encode(#{<<"error">> => <<"handler_failed">>}), S}
+            end,
             gun:ws_send(State#state.conn_pid, State#state.stream_ref,
                 {text, json:encode(#{
                     <<"action">> => <<"result">>,
                     <<"id">>     => Id,
-                    <<"data">>   => Result
+                    <<"data">>   => ResultToSend
                 })}),
             {noreply, NewState};
         _ ->
@@ -271,10 +275,12 @@ handle_info(_Info, State) ->
 %% @end
 %%--------------------------------------------------------------------
 -spec handle_call(term(), {pid(), term()}, #state{}) ->
-    {reply, {ok, binary()} | ok, #state{}}.
+    {reply, {ok, binary()} | {error, term()} | ok, #state{}}.
 handle_call({http_query, QueryBinary}, _From, State) ->
-    {Result, NewState} = dispatch(QueryBinary, State),
-    {reply, {ok, Result}, NewState};
+    case dispatch(QueryBinary, State) of
+        {ok, Result, NewState}    -> {reply, {ok, Result}, NewState};
+        {error, Reason, NewState} -> {reply, {error, Reason}, NewState}
+    end;
 handle_call(_Req, _From, State) ->
     {reply, ok, State}.
 
@@ -370,20 +376,24 @@ register_on_disco(ConnPid, StreamRef, AgentName, Config) ->
         })}).
 
 %% @private
--spec dispatch(binary(), #state{}) -> {term(), #state{}}.
+-spec dispatch(binary(), #state{}) ->
+    {ok, binary(), #state{}} | {error, handler_failed, #state{}}.
 dispatch(Body, #state{handler_module = Mod,
                       agent_name     = Name,
                       memory         = Memory,
                       memory_table   = Table} = State) ->
-    {Result, NewMemory} = try
-        Mod:handle(Body, Memory)
-    catch E:R ->
-        logger:error("Handler error",
-                     #{agent => Name, class => E, reason => R}),
-        {json:encode(#{<<"error">> => <<"handler_failed">>}), Memory}
-    end,
-    persist_memory(Table, NewMemory),
-    {Result, State#state{memory = NewMemory}}.
+    case (try {ok, Mod:handle(Body, Memory)}
+          catch E:R ->
+              logger:error("Handler error",
+                           #{agent => Name, class => E, reason => R}),
+              error
+          end) of
+        {ok, {Result, NewMemory}} ->
+            persist_memory(Table, NewMemory),
+            {ok, Result, State#state{memory = NewMemory}};
+        error ->
+            {error, handler_failed, State}
+    end.
 
 %% @private
 -spec persist_memory(atom() | undefined, map()) -> ok.
