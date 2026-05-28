@@ -441,7 +441,10 @@ handle_info(gossip_timer, #state{gossip_interval = I,
                                   stale_timeout   = St,
                                   store           = Store,
                                   peers           = Peers} = State) ->
-    %% 1. Snapshot peers to DETS BEFORE eviction.
+    %% 1. Snapshot peers to DETS before eviction.
+    %%    Saving pre-eviction ensures DETS always holds the last known peer
+    %%    addresses.  auto-repair reads DETS after isolation to reconnect,
+    %%    so we want addresses even for peers that are about to be evicted.
     case Store of
         undefined -> ok;
         _ ->
@@ -469,7 +472,10 @@ handle_info(gossip_timer, #state{gossip_interval = I,
     end,
 
     %% 4. Re-arm the timer.
-    erlang:send_after(I, self(), gossip_timer),
+    case I of
+        0 -> ok;
+        _ -> erlang:send_after(I, self(), gossip_timer)
+    end,
     {noreply, State1};
 
 %% Async gossip result — successful exchange: merge the remote's state.
