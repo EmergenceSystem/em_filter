@@ -58,8 +58,10 @@ from_capabilities(Caps) ->
 %% in little-endian byte order, as expected by kvex.
 %%
 %% Example:
+%% ```
 %%   Vec = em_filter_vec:from_capabilities([<<"rss">>, <<"search">>], 64).
 %%   %% Vec is a 256-byte binary, unit norm, usable directly with kvex.
+%% '''
 %% @end
 %%--------------------------------------------------------------------
 -spec from_capabilities([binary() | atom() | string()], pos_integer()) ->

@@ -9,10 +9,14 @@
 %%% search and decides to query it directly, the HTTP request lands here.
 %%%
 %%% Request body (JSON):
-%%%   {"query": "<user query text>"}
+%%% ```
+%%% {"query": "user query text"}
+%%% '''
 %%%
 %%% Success response — HTTP 200:
-%%%   {"results": <agent handler output>}
+%%% ```
+%%% {"results": [... agent handler output ...]}
+%%% '''
 %%%
 %%% where `<agent handler output>' is whatever `handler:handle/2' returns
 %%% (a JSON-encoded binary), decoded once so it is properly nested in
@@ -44,8 +48,10 @@
 %% so that the result is a proper JSON value rather than an escaped
 %% string:
 %%
-%%   handler returns:  <<"[{\"url\":\"...\"}]">>   (binary)
-%%   response body:    {"results": [{"url": "..."}]}
+%% ```
+%% handler returns:  <<"[{\"url\":\"...\"}]">>   (binary)
+%% response body:    {"results": [{"url": "..."}]}
+%% '''
 %%
 %% @end
 %%--------------------------------------------------------------------
