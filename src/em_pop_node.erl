@@ -441,8 +441,7 @@ handle_info(gossip_timer, #state{gossip_interval = I,
                                   stale_timeout   = St,
                                   store           = Store,
                                   peers           = Peers} = State) ->
-    %% Persist current peer set to DETS before any eviction so the full
-    %% table is available for the next startup restore.
+    %% 1. Snapshot peers to DETS BEFORE eviction.
     case Store of
         undefined -> ok;
         _ ->
@@ -451,22 +450,25 @@ handle_info(gossip_timer, #state{gossip_interval = I,
                 Err -> ?LOG_WARNING("em_pop DETS save failed: ~p", [Err])
             end
     end,
-    case map_size(Peers) of
+
+    %% 2. Evict stale and low-trust peers.
+    State1 = cleanup_stale(St, State),
+
+    %% 3. Gossip with a random survivor (skip when no peers remain after eviction).
+    case map_size(State1#state.peers) of
         0 ->
-            %% No peers yet — nothing to gossip with.
             ok;
         _ ->
-            {PeerId, Url} = pick_gossip_target(State),
-            Payload = state_to_payload(State),
+            {PeerId, Url} = pick_gossip_target(State1),
+            Payload = state_to_payload(State1),
             Self = self(),
-            %% Spawn the HTTP call so the gen_server stays responsive.
             spawn(fun() ->
                 Result = http_post(Url, Payload),
                 Self ! {gossip_result, PeerId, Result}
             end)
     end,
-    %% Evict stale peers before rescheduling.
-    State1 = cleanup_stale(St, State),
+
+    %% 4. Re-arm the timer.
     erlang:send_after(I, self(), gossip_timer),
     {noreply, State1};
 
@@ -630,19 +632,27 @@ merge_peers([P | Rest],
 %% @end
 %%--------------------------------------------------------------------
 -spec cleanup_stale(pos_integer(), #state{}) -> #state{}.
-cleanup_stale(Timeout, #state{peers = Peers} = State) ->
+cleanup_stale(Timeout,
+              #state{peers = Peers, evict_threshold = EvictT} = State) ->
     Now   = erlang:monotonic_time(millisecond),
-    Alive = maps:filter(fun(_, #peer{last_seen = LS}) ->
-        Now - LS < Timeout
+    Alive = maps:filter(fun(_, #peer{last_seen = LS, trust = T}) ->
+        Now - LS < Timeout andalso T >= EvictT
     end, Peers),
     case map_size(Alive) =:= map_size(Peers) of
         true ->
-            %% Nothing changed — avoid the index rebuild cost.
+            %% Nothing changed — skip the index rebuild.
             State;
         false ->
             Evicted = map_size(Peers) - map_size(Alive),
-            ?LOG_INFO("em_pop stale eviction: ~w peers removed", [Evicted]),
-            rebuild_kvex(State#state{peers = Alive})
+            ?LOG_INFO("em_pop eviction: ~w removed, ~w remaining",
+                      [Evicted, map_size(Alive)]),
+            State1 = rebuild_kvex(State#state{peers = Alive}),
+            %% Isolation: had peers, now have none → trigger auto-repair.
+            case map_size(Alive) =:= 0 andalso map_size(Peers) > 0 of
+                true  -> self() ! repair_isolation;
+                false -> ok
+            end,
+            State1
     end.
 
 %%--------------------------------------------------------------------
