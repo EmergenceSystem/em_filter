@@ -492,6 +492,45 @@ handle_info({gossip_result, PeerId, {error, Reason}}, State) ->
                [short_id(PeerId), Reason]),
     {noreply, decay_trust(PeerId, State)};
 
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Auto-repair on isolation.
+%%
+%% Triggered by `cleanup_stale/2' when eviction leaves the peer table
+%% empty.  Reads DETS for the pre-eviction peer host/port pairs (saved
+%% on the same gossip tick before eviction ran).  Falls back to the
+%% configured seeds when DETS is empty or persistence is disabled.
+%%
+%% At most 5 reconnections are attempted to avoid flooding.  Each
+%% add_peer call runs in a spawned process so the gen_server stays
+%% responsive.  Successful reconnections flow back through the normal
+%% `upsert_peer' path via `{add_peer, H, P}' call.
+%% @end
+%%--------------------------------------------------------------------
+handle_info(repair_isolation,
+            #state{store = Store, seeds = Seeds} = State) ->
+    DetsHosts = case Store of
+        undefined ->
+            [];
+        _ ->
+            Saved = em_pop_store:load(Store),
+            [{binary_to_list(H), P}
+             || #peer{host = H, port = P} <- maps:values(Saved)]
+    end,
+    Targets = case DetsHosts of
+        [] -> Seeds;
+        _  -> DetsHosts
+    end,
+    N = length(Targets),
+    ?LOG_WARNING("em_pop isolated — attempting repair from ~w hosts", [N]),
+    Self = self(),
+    lists:foreach(fun({H, P}) ->
+        spawn(fun() ->
+            catch gen_server:call(Self, {add_peer, H, P}, 15_000)
+        end)
+    end, lists:sublist(Targets, 5)),
+    {noreply, State};
+
 handle_info(_Msg, State) ->
     {noreply, State}.
 
