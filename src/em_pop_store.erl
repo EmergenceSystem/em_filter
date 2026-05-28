@@ -21,9 +21,13 @@
 %%--------------------------------------------------------------------
 -spec open(atom(), string()) -> {ok, atom()} | {error, term()}.
 open(Name, Dir) ->
-    ok = filelib:ensure_dir(Dir ++ "/"),
-    File = filename:join(Dir, atom_to_list(Name) ++ ".peers"),
-    dets:open_file(Name, [{file, File}, {type, set}]).
+    case filelib:ensure_dir(Dir ++ "/") of
+        ok ->
+            File = filename:join(Dir, atom_to_list(Name) ++ ".peers"),
+            dets:open_file(Name, [{file, File}, {type, set}]);
+        {error, _} = Error ->
+            Error
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc Close the DETS table.
@@ -42,13 +46,19 @@ close(Name) -> dets:close(Name).
 %%--------------------------------------------------------------------
 -spec save(atom(), #{binary() => term()}) -> ok | {error, term()}.
 save(Name, Peers) ->
-    dets:delete_all_objects(Name),
-    dets:insert(Name, maps:to_list(Peers)).
+    case dets:delete_all_objects(Name) of
+        ok    -> dets:insert(Name, maps:to_list(Peers));
+        Error -> Error
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc Read all saved peers back as a map.
 %%
 %% Returns #{} on any error so the caller never needs to handle failure.
+%%
+%% Note: `last_seen' values in restored #peer{} records are monotonic
+%% timestamps from a previous VM session and must be reset by the
+%% caller after loading to prevent immediate stale eviction.
 %% @end
 %%--------------------------------------------------------------------
 -spec load(atom()) -> #{binary() => term()}.
