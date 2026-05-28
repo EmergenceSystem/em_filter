@@ -1,19 +1,27 @@
 {application, em_filter, [
     {description, "Agent connectivity for Emergence system."},
-    {vsn, "1.2.4"},
-    {registered, [em_filter_sup]},
+    {vsn, "1.4.0"},
+    {registered, [em_filter_sup, em_pop_sup]},
     {mod, {em_filter_app, []}},
     {applications, [
         kernel,
         stdlib,
-        gun
+        inets,
+        gun,
+        cowboy,
+        kvex
     ]},
     {env, []},
     {modules, [
         em_filter_app,
         em_filter,
         em_filter_sup,
-        em_filter_server
+        em_filter_server,
+        em_filter_http,
+        em_filter_vec,
+        em_pop_sup,
+        em_pop_node,
+        em_pop_http
     ]},
     {licenses, ["Apache-2.0"]},
     {links, [{"GitHub", "https://github.com/EmergenceSystem/em_filter"}]}
