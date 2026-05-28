@@ -9,6 +9,7 @@
         inets,
         gun,
         cowboy,
+        sied,
         kvex
     ]},
     {env, []},
