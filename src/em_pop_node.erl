@@ -114,7 +114,10 @@
     kvex_ix                     :: term(),                     %% kvex cosine-search index
     stale_timeout               :: pos_integer(),              %% peer eviction threshold (ms)
     gossip_interval             :: non_neg_integer(),          %% background tick interval (ms)
-    max_peers                   :: pos_integer()               %% peer list capacity
+    max_peers                   :: pos_integer(),              %% peer list capacity
+    seeds = []                  :: [{string(), inet:port_number()}],  %% bootstrap peers for auto-repair
+    evict_threshold = 0.0       :: float(),                           %% trust floor; 0.0 = disabled
+    store = undefined           :: atom() | undefined                 %% DETS table name
 }).
 
 %%====================================================================
@@ -230,27 +233,53 @@ init(Opts) ->
     MaxP      = maps:get(max_peers,       Opts, ?DEFAULT_MAX_PEERS),
     QueryPort = maps:get(query_port,      Opts, undefined),
     Name      = maps:get(name,            Opts, <<>>),
-    Id      = generate_id(),
+    Seeds     = maps:get(seeds,           Opts, []),
+    EvictT    = maps:get(evict_threshold, Opts, 0.0),
+    PDir      = maps:get(persist_dir,     Opts, undefined),
+    Id        = generate_id(),
 
-    %% Vector dimension is byte_size / 4 because each float is 32-bit.
     Dim = byte_size(Vec) div 4,
-
-    %% httpc lives inside the inets application — start it if not yet up.
     application:ensure_all_started(inets),
-
-    %% Start the Cowboy listener that will accept incoming gossip POSTs.
     ok = start_listener(Port, self()),
-
-    %% Empty kvex index — vectors are added one by one as peers are discovered.
     {ok, Ix} = kvex:new(Dim),
 
-    %% Schedule the background gossip loop (0 = disabled, e.g. in tests).
+    %% Open DETS and restore saved peers when persist_dir is configured.
+    %% Note: restored #peer{} records have stale last_seen timestamps from
+    %% the previous VM session. Reset them to now so peers aren't immediately
+    %% evicted by cleanup_stale on the first gossip tick.
+    {Store, RestoredPeers, Ix1} = case PDir of
+        undefined ->
+            {undefined, #{}, Ix};
+        Dir ->
+            SName = list_to_atom("em_pop_" ++ binary_to_list(Name)),
+            case em_pop_store:open(SName, Dir) of
+                {ok, _} ->
+                    Saved = em_pop_store:load(SName),
+                    Now   = erlang:monotonic_time(millisecond),
+                    %% Reset last_seen to now — DETS timestamps are from a
+                    %% previous VM session and would cause immediate eviction.
+                    Fresh = maps:map(fun(_, P) ->
+                        P#peer{last_seen = Now, trust = 0.0}
+                    end, Saved),
+                    %% Rebuild kvex index from restored peers.
+                    maps:foreach(fun(PId, #peer{vector = V}) ->
+                        kvex:add(Ix, PId, V)
+                    end, Fresh),
+                    {SName, Fresh, Ix};
+                {error, Reason} ->
+                    ?LOG_WARNING("em_pop persist_dir open failed dir=~s reason=~p",
+                                 [Dir, Reason]),
+                    {undefined, #{}, Ix}
+            end
+    end,
+
     case GossipI of
         0 -> ok;
         I -> erlang:send_after(I, self(), gossip_timer)
     end,
 
-    ?LOG_INFO("em_pop node started id=~s port=~w", [short_id(Id), Port]),
+    ?LOG_INFO("em_pop node started id=~s port=~w restored=~w",
+              [short_id(Id), Port, map_size(RestoredPeers)]),
 
     {ok, #state{
         id              = Id,
@@ -258,10 +287,14 @@ init(Opts) ->
         query_port      = QueryPort,
         name            = Name,
         vector          = Vec,
-        kvex_ix         = Ix,
+        peers           = RestoredPeers,
+        kvex_ix         = Ix1,
         stale_timeout   = StaleT,
         gossip_interval = GossipI,
-        max_peers       = MaxP
+        max_peers       = MaxP,
+        seeds           = Seeds,
+        evict_threshold = EvictT,
+        store           = Store
     }}.
 
 %% --- Simple state accessors ---
@@ -397,7 +430,14 @@ handle_cast(_Msg, State) ->
 %%--------------------------------------------------------------------
 handle_info(gossip_timer, #state{gossip_interval = I,
                                   stale_timeout   = St,
+                                  store           = Store,
                                   peers           = Peers} = State) ->
+    %% Persist current peer set to DETS before any eviction so the full
+    %% table is available for the next startup restore.
+    case Store of
+        undefined -> ok;
+        _         -> em_pop_store:save(Store, Peers)
+    end,
     case map_size(Peers) of
         0 ->
             %% No peers yet — nothing to gossip with.
@@ -439,9 +479,13 @@ handle_info(_Msg, State) ->
 %% @doc Stop the Cowboy listener when the node goes down.
 %% @end
 %%--------------------------------------------------------------------
-terminate(_Reason, #state{port = Port, id = Id}) ->
+terminate(_Reason, #state{port = Port, id = Id, store = Store}) ->
     ?LOG_INFO("em_pop node stopping id=~s port=~w", [short_id(Id), Port]),
     cowboy:stop_listener(listener_ref(Port)),
+    case Store of
+        undefined -> ok;
+        _         -> em_pop_store:close(Store)
+    end,
     ok.
 
 %%====================================================================
