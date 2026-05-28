@@ -96,6 +96,7 @@
     host                   :: binary(),           %% hostname or IP (binary string)
     port                   :: inet:port_number(), %% TCP port of the peer's gossip listener
     query_port = undefined :: pos_integer() | undefined,  %% direct HTTP query port (null if not exposed)
+    name = <<>>            :: binary(),           %% human-readable agent name (OTP app name)
     vector                 :: binary(),           %% capability vector (f32 flat binary)
     trust = 0.0            :: float(),            %% trust score in [0.0, 1.0]
     last_seen              :: integer()           %% erlang:monotonic_time(millisecond)
@@ -107,6 +108,7 @@
     host = <<"localhost">>      :: binary(),                   %% advertised hostname
     port                        :: inet:port_number(),         %% gossip HTTP listener port
     query_port = undefined      :: pos_integer() | undefined,  %% direct HTTP query port (null if not exposed)
+    name = <<>>                 :: binary(),                   %% human-readable agent name (OTP app name)
     vector                      :: binary(),                   %% this node's capability vector
     peers = #{}                 :: #{binary() => #peer{}},     %% known peers by ID
     kvex_ix                     :: term(),                     %% kvex cosine-search index
@@ -227,6 +229,7 @@ init(Opts) ->
     GossipI   = maps:get(gossip_interval, Opts, ?DEFAULT_GOSSIP_INTERVAL),
     MaxP      = maps:get(max_peers,       Opts, ?DEFAULT_MAX_PEERS),
     QueryPort = maps:get(query_port,      Opts, undefined),
+    Name      = maps:get(name,            Opts, <<>>),
     Id      = generate_id(),
 
     %% Vector dimension is byte_size / 4 because each float is 32-bit.
@@ -253,6 +256,7 @@ init(Opts) ->
         id              = Id,
         port            = Port,
         query_port      = QueryPort,
+        name            = Name,
         vector          = Vec,
         kvex_ix         = Ix,
         stale_timeout   = StaleT,
@@ -684,12 +688,13 @@ http_post(Url, Payload) ->
 %% Serialise the local node's state for transmission.
 -spec state_to_payload(#state{}) -> map().
 state_to_payload(#state{id = Id, host = Host, port = Port,
-                         query_port = QPort,
+                         query_port = QPort, name = Name,
                          vector = Vec, peers = Peers}) ->
     #{<<"id">>         => base64:encode(Id),
       <<"host">>       => Host,
       <<"port">>       => Port,
       <<"query_port">> => case QPort of undefined -> null; P -> P end,
+      <<"name">>       => Name,
       <<"vector">>     => base64:encode(Vec),
       %% Include our own peer list so the remote can discover them too.
       <<"peers">>      => [peer_to_payload(P) || P <- maps:values(Peers)]}.
@@ -697,11 +702,12 @@ state_to_payload(#state{id = Id, host = Host, port = Port,
 %% Serialise one #peer{} record for embedding in a payload.
 -spec peer_to_payload(#peer{}) -> map().
 peer_to_payload(#peer{id = Id, host = H, port = P, query_port = QP,
-                      vector = V, trust = T}) ->
+                      name = Name, vector = V, trust = T}) ->
     #{<<"id">>         => base64:encode(Id),
       <<"host">>       => H,
       <<"port">>       => P,
       <<"query_port">> => case QP of undefined -> null; Q -> Q end,
+      <<"name">>       => Name,
       <<"vector">>     => base64:encode(V),
       <<"trust">>      => T}.
 
@@ -715,11 +721,13 @@ payload_to_peer(#{<<"id">>     := Id,
         null -> undefined;
         P    -> P
     end,
+    Name = maps:get(<<"name">>, Map, <<>>),
     #peer{
         id         = base64:decode(Id),
         host       = Host,
         port       = Port,
         query_port = QPort,
+        name       = Name,
         vector     = base64:decode(Vec),
         %% Set last_seen to now — we just heard from this node.
         last_seen  = erlang:monotonic_time(millisecond)
@@ -736,12 +744,13 @@ payload_to_peers(_) ->
 %% Convert a #peer{} record to a plain map for the public API.
 -spec peer_to_map(#peer{}) -> map().
 peer_to_map(#peer{id = Id, host = H, port = P,
-                  query_port = QP,
+                  query_port = QP, name = Name,
                   vector = V, trust = T, last_seen = LS}) ->
     #{id         => Id,
       host       => H,
       port       => P,
       query_port => QP,
+      name       => Name,
       vector     => V,
       trust      => T,
       last_seen  => LS}.

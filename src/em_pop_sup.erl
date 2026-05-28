@@ -80,7 +80,11 @@ start_link() ->
 %%--------------------------------------------------------------------
 -spec start_node(atom(), map()) -> {ok, pid()} | {error, term()}.
 start_node(AgentName, Opts) ->
-    case supervisor:start_child(?MODULE, [Opts]) of
+    %% Inject the agent name into the opts so it propagates through gossip.
+    %% The caller may override this by setting `name' explicitly.
+    NameBin   = atom_to_binary(AgentName, utf8),
+    OptsWithName = maps:merge(#{name => NameBin}, Opts),
+    case supervisor:start_child(?MODULE, [OptsWithName]) of
         {ok, Pid} ->
             %% Register the new pid under the agent's name for fast lookup.
             ets:insert(?TABLE, {AgentName, Pid}),
