@@ -194,6 +194,7 @@ maybe_start_pop_node(AgentName, Config) ->
 
             PopOpts = #{
                 port            => Port,
+                name            => atom_to_binary(AgentName, utf8),
                 vector          => Vec,
                 seeds           => Seeds,
                 evict_threshold => maps:get(pop_evict_threshold, Config, 0.0),
