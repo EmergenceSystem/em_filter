@@ -51,33 +51,42 @@
 %%--------------------------------------------------------------------
 init(Req0, #{server := ServerName} = State) ->
     {ok, Body, Req1} = cowboy_req:read_body(Req0, #{length => 64_000, period => 5_000}),
-    try
-        #{<<"query">> := Query} = json:decode(Body),
-        case gen_server:call(ServerName, {http_query, Query}, 30_000) of
-            {ok, RawResult} ->
-                %% Decode the handler's JSON output so it nests cleanly.
-                Decoded  = try json:decode(RawResult)
-                           catch _:_ -> RawResult end,
-                RespBody = iolist_to_binary(
-                    json:encode(#{<<"results">> => Decoded})),
-                Req2 = cowboy_req:reply(200,
-                    #{<<"content-type">> => <<"application/json">>},
-                    RespBody, Req1),
-                {ok, Req2, State};
-            {error, Reason} ->
-                Msg  = iolist_to_binary(io_lib:format("~p", [Reason])),
-                Req2 = cowboy_req:reply(500,
-                    #{<<"content-type">> => <<"application/json">>},
-                    iolist_to_binary(
-                        json:encode(#{<<"error">> => Msg})),
-                    Req1),
-                {ok, Req2, State}
-        end
-    catch
-        %% Malformed JSON or missing "query" key.
-        _:_ ->
-            ErrReq = cowboy_req:reply(400, #{},
+    %% Step 1: decode and validate the request body.
+    case (try {ok, json:decode(Body)} catch _:_ -> error end) of
+        error ->
+            Req2 = cowboy_req:reply(400, #{},
                 <<"{\"error\":\"body must be JSON with a 'query' field\"}">>,
                 Req1),
-            {ok, ErrReq, State}
+            {ok, Req2, State};
+        {ok, #{<<"query">> := Query}} ->
+            %% Step 2: call the agent server. Wrap separately so exit signals
+            %% (timeout, noproc) are returned as 500, not confused with 400.
+            CallResult = try gen_server:call(ServerName, {http_query, Query}, 30_000)
+                         catch exit:ExitReason -> {error, ExitReason}
+                         end,
+            case CallResult of
+                {ok, RawResult} ->
+                    Decoded  = try json:decode(RawResult)
+                               catch _:_ -> RawResult end,
+                    RespBody = iolist_to_binary(
+                        json:encode(#{<<"results">> => Decoded})),
+                    Req2 = cowboy_req:reply(200,
+                        #{<<"content-type">> => <<"application/json">>},
+                        RespBody, Req1),
+                    {ok, Req2, State};
+                {error, Reason} ->
+                    Msg  = iolist_to_binary(io_lib:format("~p", [Reason])),
+                    Req2 = cowboy_req:reply(500,
+                        #{<<"content-type">> => <<"application/json">>},
+                        iolist_to_binary(
+                            json:encode(#{<<"error">> => Msg})),
+                        Req1),
+                    {ok, Req2, State}
+            end;
+        {ok, _} ->
+            %% Valid JSON but missing "query" key.
+            Req2 = cowboy_req:reply(400, #{},
+                <<"{\"error\":\"body must be JSON with a 'query' field\"}">>,
+                Req1),
+            {ok, Req2, State}
     end.
