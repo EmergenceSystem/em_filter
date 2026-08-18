@@ -240,6 +240,7 @@ init(Opts) ->
 
     Dim = byte_size(Vec) div 4,
     application:ensure_all_started(inets),
+    _ = start_gossip_profile(),
     ok = start_listener(Port, self()),
     {ok, Ix} = kvex:new(Dim),
 
@@ -774,11 +775,22 @@ gossip_url(Host, Port) ->
 %% @end
 %%--------------------------------------------------------------------
 -spec http_post(string(), map()) -> {ok, map()} | {error, term()}.
+%% Dedicated httpc profile for gossip so it never contends with the host
+%% application's default-profile httpc (e.g. a filter forwarding a query/upload
+%% to a backend while this node gossips) — that contention could otherwise
+%% stall the app's own requests.
+start_gossip_profile() ->
+    case inets:start(httpc, [{profile, em_pop}]) of
+        {ok, _}                       -> ok;
+        {error, {already_started, _}} -> ok;
+        _                             -> ok
+    end.
+
 http_post(Url, Payload) ->
     Body = iolist_to_binary(json:encode(Payload)),
     Req  = {Url, [], "application/json", Body},
     Opts = [{timeout, ?GOSSIP_HTTP_TIMEOUT}],
-    case httpc:request(post, Req, Opts, [{body_format, binary}]) of
+    case httpc:request(post, Req, Opts, [{body_format, binary}], em_pop) of
         {ok, {{_, 200, _}, _, RespBody}} ->
             try  {ok, json:decode(RespBody)}
             catch _:_ -> {error, bad_json}
