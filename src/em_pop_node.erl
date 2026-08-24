@@ -889,16 +889,17 @@ peers_to_maps(Peers) ->
 %%====================================================================
 
 %% Generate a cryptographically random 16-byte node identifier.
--spec %% @private Deterministic node id from the listen port, so a node keeps
+%% @private Deterministic node id from the listen port, so a node keeps
 %% the same identity across restarts and does not create duplicate peers.
 %% Pop ports are unique per node on a host; falls back to random otherwise.
+-spec stable_id(integer()) -> binary().
 stable_id(Port) when is_integer(Port), Port > 0 ->
     binary:part(crypto:hash(sha256,
         <<"em_pop_node:", (integer_to_binary(Port))/binary>>), 0, 16);
 stable_id(_) ->
     generate_id().
 
-generate_id() -> binary().
+-spec generate_id() -> binary().
 generate_id() ->
     crypto:strong_rand_bytes(16).
 
