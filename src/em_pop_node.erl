@@ -237,6 +237,11 @@ init(Opts) ->
     EvictT    = maps:get(evict_threshold, Opts, 0.0),
     PDir      = maps:get(persist_dir,     Opts, undefined),
     Id        = stable_id(Port),
+    AdvHost   = case maps:get(advertise_host, Opts, <<"localhost">>) of
+                    HB when is_binary(HB) -> HB;
+                    HL when is_list(HL)   -> list_to_binary(HL);
+                    _                     -> <<"localhost">>
+                end,
 
     Dim = byte_size(Vec) div 4,
     application:ensure_all_started(inets),
@@ -293,6 +298,7 @@ init(Opts) ->
 
     {ok, #state{
         id              = Id,
+        host            = AdvHost,
         port            = Port,
         query_port      = QueryPort,
         name            = Name,
