@@ -246,10 +246,15 @@ init(Opts) ->
                 end,
     AdvPort   = maps:get(advertise_port, Opts, Port),
     AdvQPort  = maps:get(advertise_query_port, Opts, QueryPort),
-    case maps:get(auth_token, Opts, undefined) of
-        AT when is_binary(AT) -> application:set_env(em_filter, auth_token, AT);
-        AL when is_list(AL)   -> application:set_env(em_filter, auth_token, list_to_binary(AL));
-        _                     -> ok
+    AuthTok0 = case maps:get(auth_token, Opts, undefined) of
+                   undefined -> os:getenv("EM_POP_AUTH_TOKEN");
+                   V -> V
+               end,
+    case AuthTok0 of
+        false                          -> ok;
+        AT when is_binary(AT)          -> application:set_env(em_filter, auth_token, AT);
+        AL when is_list(AL), AL =/= [] -> application:set_env(em_filter, auth_token, list_to_binary(AL));
+        _                              -> ok
     end,
 
     Dim = byte_size(Vec) div 4,
