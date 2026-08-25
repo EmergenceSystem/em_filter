@@ -195,6 +195,9 @@ maybe_start_pop_node(AgentName, Config) ->
             PopOpts = #{
                 port            => Port,
                 advertise_host  => maps:get(pop_advertise_host, Config, <<"localhost">>),
+                advertise_port  => maps:get(pop_advertise_port, Config, Port),
+                advertise_query_port => maps:get(pop_advertise_query_port, Config, maps:get(query_port, Config, undefined)),
+                auth_token      => maps:get(pop_auth_token, Config, undefined),
                 name            => atom_to_binary(AgentName, utf8),
                 vector          => Vec,
                 seeds           => Seeds,

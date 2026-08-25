@@ -55,7 +55,23 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
-init(Req0, #{server := ServerName} = State) ->
+init(Req0, State) ->
+    case em_filter_authz(Req0) of
+        true  -> handle(Req0, State);
+        false -> {ok, cowboy_req:reply(401, #{}, <<"unauthorized">>, Req0), State}
+    end.
+
+em_filter_authz(Req) ->
+    case application:get_env(em_filter, auth_token, undefined) of
+        undefined -> true;
+        Tok ->
+            case cowboy_req:header(<<"authorization">>, Req) of
+                <<"Bearer ", T/binary>> when T =:= Tok -> true;
+                _ -> false
+            end
+    end.
+
+handle(Req0, #{server := ServerName} = State) ->
     {ok, Body, Req1} = cowboy_req:read_body(Req0, #{length => 64_000, period => 5_000}),
     %% Step 1: decode and validate the request body.
     case (try {ok, json:decode(Body)} catch _:_ -> error end) of

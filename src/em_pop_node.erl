@@ -117,7 +117,9 @@
     max_peers                   :: pos_integer(),              %% peer list capacity
     seeds = []                  :: [{string(), inet:port_number()}],  %% bootstrap peers for auto-repair
     evict_threshold = 0.0       :: float(),                           %% trust floor; 0.0 = disabled
-    store = undefined           :: atom() | undefined                 %% DETS table name
+    store = undefined           :: atom() | undefined,                %% DETS table name
+    adv_port = undefined        :: pos_integer() | undefined,         %% advertised gossip port (default = port)
+    adv_query_port = undefined  :: pos_integer() | undefined          %% advertised query port (default = query_port)
 }).
 
 %%====================================================================
@@ -242,6 +244,13 @@ init(Opts) ->
                     HL when is_list(HL)   -> list_to_binary(HL);
                     _                     -> <<"localhost">>
                 end,
+    AdvPort   = maps:get(advertise_port, Opts, Port),
+    AdvQPort  = maps:get(advertise_query_port, Opts, QueryPort),
+    case maps:get(auth_token, Opts, undefined) of
+        AT when is_binary(AT) -> application:set_env(em_filter, auth_token, AT);
+        AL when is_list(AL)   -> application:set_env(em_filter, auth_token, list_to_binary(AL));
+        _                     -> ok
+    end,
 
     Dim = byte_size(Vec) div 4,
     application:ensure_all_started(inets),
@@ -299,6 +308,8 @@ init(Opts) ->
     {ok, #state{
         id              = Id,
         host            = AdvHost,
+        adv_port        = AdvPort,
+        adv_query_port  = AdvQPort,
         port            = Port,
         query_port      = QueryPort,
         name            = Name,
@@ -769,6 +780,8 @@ listener_ref(Port) -> {em_pop_listener, Port}.
 
 %% Build the full URL for a peer's gossip endpoint.
 -spec gossip_url(string(), inet:port_number()) -> string().
+gossip_url(Host, 443) ->
+    lists:flatten(io_lib:format("https://~s/pop/gossip", [Host]));
 gossip_url(Host, Port) ->
     lists:flatten(io_lib:format("http://~s:~w/pop/gossip", [Host, Port])).
 
@@ -794,7 +807,11 @@ start_gossip_profile() ->
 
 http_post(Url, Payload) ->
     Body = iolist_to_binary(json:encode(Payload)),
-    Req  = {Url, [], "application/json", Body},
+    Hdrs = case application:get_env(em_filter, auth_token, undefined) of
+               undefined -> [];
+               Tok -> [{"authorization", "Bearer " ++ binary_to_list(Tok)}]
+           end,
+    Req  = {Url, Hdrs, "application/json", Body},
     Opts = [{timeout, ?GOSSIP_HTTP_TIMEOUT}],
     case httpc:request(post, Req, Opts, [{body_format, binary}], em_pop) of
         {ok, {{_, 200, _}, _, RespBody}} ->
@@ -817,13 +834,15 @@ http_post(Url, Payload) ->
 
 %% Serialise the local node's state for transmission.
 -spec state_to_payload(#state{}) -> map().
-state_to_payload(#state{id = Id, host = Host, port = Port,
-                         query_port = QPort, name = Name,
+state_to_payload(#state{id = Id, host = Host, port = Port, adv_port = AdvPort,
+                         query_port = QPort, adv_query_port = AdvQPort, name = Name,
                          vector = Vec, peers = Peers}) ->
+    EffPort  = case AdvPort of undefined -> Port; _ -> AdvPort end,
+    EffQPort = case AdvQPort of undefined -> QPort; _ -> AdvQPort end,
     #{<<"id">>         => base64:encode(Id),
       <<"host">>       => Host,
-      <<"port">>       => Port,
-      <<"query_port">> => case QPort of undefined -> null; P -> P end,
+      <<"port">>       => EffPort,
+      <<"query_port">> => case EffQPort of undefined -> null; P -> P end,
       <<"name">>       => Name,
       <<"vector">>     => base64:encode(Vec),
       %% Include our own peer list so the remote can discover them too.
