@@ -86,6 +86,12 @@
 -define(TRUST_MAX,                  1.00).
 -define(TRUST_MIN,                  0.00).
 
+%% Consecutive failed direct contacts before a peer is declared dead.
+-define(DEFAULT_DEAD_THRESHOLD,        3).
+
+%% Milliseconds a dead peer is refused re-entry (blocks gossip re-infection).
+-define(DEFAULT_QUARANTINE_TTL,   60_000).
+
 %%====================================================================
 %% Records
 %%====================================================================
@@ -99,7 +105,10 @@
     name = <<>>            :: binary(),           %% human-readable agent name (OTP app name)
     vector                 :: binary(),           %% capability vector (f32 flat binary)
     trust = 0.0            :: float(),            %% trust score in [0.0, 1.0]
-    last_seen              :: integer()           %% erlang:monotonic_time(millisecond)
+    last_seen              :: integer(),          %% erlang:monotonic_time(millisecond)
+    fail_count = 0         :: non_neg_integer(),  %% consecutive failed direct contacts
+    base_path = <<>>       :: binary(),           %% public path prefix (hub-rewritten leaf)
+    role = hub             :: leaf | hub          %% role advertised by this peer
 }).
 
 %% gen_server state for the local node.
@@ -119,7 +128,12 @@
     evict_threshold = 0.0       :: float(),                           %% trust floor; 0.0 = disabled
     store = undefined           :: atom() | undefined,                %% DETS table name
     adv_port = undefined        :: pos_integer() | undefined,         %% advertised gossip port (default = port)
-    adv_query_port = undefined  :: pos_integer() | undefined          %% advertised query port (default = query_port)
+    adv_query_port = undefined  :: pos_integer() | undefined,         %% advertised query port (default = query_port)
+    quarantine = #{}            :: #{binary() => integer()},          %% dead peer id => quarantine expiry (mono ms)
+    dead_threshold = 3          :: pos_integer(),                     %% failed contacts before a peer is dead
+    quarantine_ttl = 60000      :: pos_integer(),                    %% ms a dead peer is refused re-entry
+    role = hub                  :: leaf | hub,                        %% leaf=filter (self-only), hub=disco (federates)
+    public_host = undefined     :: binary() | undefined              %% hub public host for rewriting local leaves
 }).
 
 %%====================================================================
@@ -237,6 +251,14 @@ init(Opts) ->
     Name      = maps:get(name,            Opts, <<>>),
     Seeds     = maps:get(seeds,           Opts, []),
     EvictT    = maps:get(evict_threshold, Opts, 0.0),
+    DeadT     = maps:get(dead_threshold,  Opts, ?DEFAULT_DEAD_THRESHOLD),
+    QTtl      = maps:get(quarantine_ttl,  Opts, ?DEFAULT_QUARANTINE_TTL),
+    Role0     = maps:get(role,            Opts, hub),
+    PubHost0  = case maps:get(public_host, Opts, undefined) of
+                    PB when is_binary(PB) -> PB;
+                    PL when is_list(PL)   -> list_to_binary(PL);
+                    _                     -> undefined
+                end,
     PDir      = maps:get(persist_dir,     Opts, undefined),
     Id        = stable_id(Port),
     AdvHost   = case maps:get(advertise_host, Opts, <<"localhost">>) of
@@ -326,7 +348,11 @@ init(Opts) ->
         max_peers       = MaxP,
         seeds           = Seeds,
         evict_threshold = EvictT,
-        store           = Store
+        store           = Store,
+        dead_threshold  = DeadT,
+        quarantine_ttl  = QTtl,
+        role            = Role0,
+        public_host     = PubHost0
     }}.
 
 %% --- Simple state accessors ---
@@ -480,18 +506,34 @@ handle_info(gossip_timer, #state{gossip_interval = I,
     %% 2. Evict stale and low-trust peers.
     State1 = cleanup_stale(St, State),
 
+    %% 2b. Self-healing federation: re-contact any configured seed that is not
+    %% currently a peer. Makes cross-disco links survive restarts and boot-time
+    %% races (the one-shot bootstrap in the app may miss a peer that was down).
+    SelfPid0 = self(),
+    %% Always re-gossip the configured seeds each tick so the federation
+    %% anchors (and the leaves they advertise) never age out between the rare
+    %% random-target gossips.
+    lists:foreach(fun({SdH, SdP}) ->
+        spawn(fun() ->
+            catch gen_server:call(SelfPid0, {add_peer, SdH, SdP}, 15_000)
+        end)
+    end, State1#state.seeds),
+
     %% 3. Gossip with a random survivor (skip when no peers remain after eviction).
     case map_size(State1#state.peers) of
         0 ->
             ok;
         _ ->
-            {PeerId, Url} = pick_gossip_target(State1),
-            Payload = state_to_payload(State1),
-            Self = self(),
-            spawn(fun() ->
-                Result = http_post(Url, Payload),
-                Self ! {gossip_result, PeerId, Result}
-            end)
+            case pick_gossip_target(State1) of
+                none -> ok;
+                {ok, PeerId, Url} ->
+                    Payload = state_to_payload(State1),
+                    Self = self(),
+                    spawn(fun() ->
+                        Result = http_post(Url, Payload),
+                        Self ! {gossip_result, PeerId, Result}
+                    end)
+            end
     end,
 
     %% 4. Re-arm the timer.
@@ -513,7 +555,7 @@ handle_info({gossip_result, _PeerId, {ok, RemotePayload}}, State) ->
 handle_info({gossip_result, PeerId, {error, Reason}}, State) ->
     ?LOG_DEBUG("em_pop bg gossip failed peer=~s reason=~p",
                [short_id(PeerId), Reason]),
-    {noreply, decay_trust(PeerId, State)};
+    {noreply, mark_failure(PeerId, State)};
 
 %%--------------------------------------------------------------------
 %% @private
@@ -585,10 +627,15 @@ terminate(_Reason, #state{port = Port, id = Id, store = Store}) ->
 %%--------------------------------------------------------------------
 -spec pick_gossip_target(#state{}) -> {binary(), string()}.
 pick_gossip_target(#state{peers = Peers}) ->
-    Ids    = maps:keys(Peers),
-    PeerId = lists:nth(rand:uniform(length(Ids)), Ids),
-    #peer{host = H, port = P} = maps:get(PeerId, Peers),
-    {PeerId, gossip_url(binary_to_list(H), P)}.
+    Candidates = [Id || {Id, #peer{base_path = BP, role = R}} <- maps:to_list(Peers),
+                        BP =:= <<>>, R =:= hub],
+    case Candidates of
+        [] -> none;
+        _  ->
+            PeerId = lists:nth(rand:uniform(length(Candidates)), Candidates),
+            #peer{host = H, port = P} = maps:get(PeerId, Peers),
+            {ok, PeerId, gossip_url(binary_to_list(H), P)}
+    end.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -614,21 +661,25 @@ upsert_peer(#peer{id = Id} = New,
             kvex:add(Ix, Id, New#peer.vector),
             {?TRUST_INIT, false}
     end,
+    Q1 = maps:remove(Id, State#state.quarantine),
     case NeedsReindex of
         true ->
             %% Vector changed — rebuild the entire index for consistency.
             rebuild_kvex(State#state{
+                quarantine = Q1,
                 peers = Peers#{Id => New#peer{
-                    trust     = Trust,
-                    last_seen = erlang:monotonic_time(millisecond)
+                    trust      = Trust,
+                    fail_count = 0,
+                    last_seen  = erlang:monotonic_time(millisecond)
                 }}
             });
         false ->
             Updated = New#peer{
-                trust     = Trust,
-                last_seen = erlang:monotonic_time(millisecond)
+                trust      = Trust,
+                fail_count = 0,
+                last_seen  = erlang:monotonic_time(millisecond)
             },
-            State#state{peers = Peers#{Id => Updated}}
+            State#state{quarantine = Q1, peers = Peers#{Id => Updated}}
     end.
 
 %%--------------------------------------------------------------------
@@ -652,6 +703,37 @@ decay_trust(PeerId, #state{peers = Peers} = State) ->
 
 %%--------------------------------------------------------------------
 %% @private
+%% @doc Record a failed direct contact. After dead_threshold consecutive
+%% failures the peer is declared dead: evicted and quarantined for
+%% quarantine_ttl ms, during which merge_peers refuses to re-learn it from
+%% other nodes gossip (stops mesh-wide re-infection of a dead peer). A
+%% successful contact (upsert_peer) resets the counter and lifts the
+%% quarantine, so a genuinely returned node re-joins automatically.
+%% @end
+-spec mark_failure(binary(), #state{}) -> #state{}.
+mark_failure(PeerId, #state{peers = Peers, quarantine = Q,
+                            dead_threshold = DeadT, quarantine_ttl = TTL} = State) ->
+    case maps:find(PeerId, Peers) of
+        {ok, #peer{fail_count = FC, trust = T} = Peer} ->
+            FC1 = FC + 1,
+            case FC1 >= DeadT of
+                true ->
+                    Now = erlang:monotonic_time(millisecond),
+                    rebuild_kvex(State#state{
+                        peers      = maps:remove(PeerId, Peers),
+                        quarantine = Q#{PeerId => Now + TTL}
+                    });
+                false ->
+                    NewTrust = max(?TRUST_MIN, T - ?TRUST_DECAY),
+                    State#state{peers = Peers#{PeerId =>
+                        Peer#peer{fail_count = FC1, trust = NewTrust}}}
+            end;
+        error ->
+            State
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
 %% @doc Merge a list of peers received from a remote node (transitive
 %% discovery).
 %%
@@ -664,31 +746,51 @@ decay_trust(PeerId, #state{peers = Peers} = State) ->
 %% @end
 %%--------------------------------------------------------------------
 -spec merge_peers([#peer{}], #state{}) -> #state{}.
+merge_peers(_, #state{role = leaf} = State) ->
+    %% Leaves never build a peer table; they only talk to their hub.
+    State;
 merge_peers([], State) ->
     State;
 merge_peers([#peer{id = Id} | Rest], #state{id = Id} = State) ->
     %% This entry describes ourselves — skip.
     merge_peers(Rest, State);
 merge_peers([P | Rest],
-            #state{peers = Peers, max_peers = Max, kvex_ix = Ix} = State) ->
+            #state{peers = Peers, max_peers = Max, kvex_ix = Ix,
+                   quarantine = Q} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    Quarantined = case maps:find(P#peer.id, Q) of
+                      {ok, Exp} -> Now < Exp;
+                      error     -> false
+                  end,
     case maps:is_key(P#peer.id, Peers) of
         true ->
             %% Already in the table — direct contact (upsert_peer) will
             %% refresh it when we gossip with it.
+            merge_peers(Rest, State);
+        false when Quarantined ->
+            %% Recently declared dead — refuse re-entry until quarantine
+            %% expires. Stops a dead peer bouncing back via other gossip.
             merge_peers(Rest, State);
         false when map_size(Peers) >= Max ->
             %% Peer list at capacity — stop adding more.
             ?LOG_DEBUG("em_pop max_peers=~w reached, dropping new peer", [Max]),
             State;
         false ->
-            %% New peer discovered transitively — index it and add to map.
-            kvex:add(Ix, P#peer.id, P#peer.vector),
-            NewPeer = P#peer{
-                trust     = ?TRUST_MIN,
-                last_seen = erlang:monotonic_time(millisecond)
-            },
-            State1 = State#state{peers = Peers#{P#peer.id => NewPeer}},
-            merge_peers(Rest, State1)
+            ExpBytes = byte_size(State#state.vector),
+            case byte_size(P#peer.vector) =:= ExpBytes andalso ExpBytes > 0 of
+                false ->
+                    %% Malformed vector — skip this peer, keep merging.
+                    merge_peers(Rest, State);
+                true ->
+                    %% New peer discovered transitively — index it and add.
+                    kvex:add(Ix, P#peer.id, P#peer.vector),
+                    NewPeer = P#peer{
+                        trust     = ?TRUST_MIN,
+                        last_seen = erlang:monotonic_time(millisecond)
+                    },
+                    State1 = State#state{peers = Peers#{P#peer.id => NewPeer}},
+                    merge_peers(Rest, State1)
+            end
     end.
 
 %%--------------------------------------------------------------------
@@ -701,8 +803,11 @@ merge_peers([P | Rest],
 %%--------------------------------------------------------------------
 -spec cleanup_stale(pos_integer(), #state{}) -> #state{}.
 cleanup_stale(Timeout,
-              #state{peers = Peers, evict_threshold = EvictT} = State) ->
+              #state{peers = Peers, evict_threshold = EvictT,
+                     quarantine = Q0} = State0) ->
     Now   = erlang:monotonic_time(millisecond),
+    Q1    = maps:filter(fun(_, Exp) -> Now < Exp end, Q0),
+    State = State0#state{quarantine = Q1},
     Alive = maps:filter(fun(_, #peer{last_seen = LS, trust = T}) ->
         Now - LS < Timeout andalso T >= EvictT
     end, Peers),
@@ -841,29 +946,63 @@ http_post(Url, Payload) ->
 -spec state_to_payload(#state{}) -> map().
 state_to_payload(#state{id = Id, host = Host, port = Port, adv_port = AdvPort,
                          query_port = QPort, adv_query_port = AdvQPort, name = Name,
-                         vector = Vec, peers = Peers}) ->
+                         vector = Vec, peers = Peers, role = Role,
+                         public_host = PublicHost}) ->
     EffPort  = case AdvPort of undefined -> Port; _ -> AdvPort end,
     EffQPort = case AdvQPort of undefined -> QPort; _ -> AdvQPort end,
+    %% A leaf advertises only itself; a hub advertises its peer list, with
+    %% any local (localhost) leaf rewritten to its public address so raw
+    %% localhost entries never cross the wire.
+    AdvPeers = case Role of
+                   leaf -> [];
+                   _    -> [peer_to_payload(rewrite_local(Pr, PublicHost))
+                            || Pr <- maps:values(Peers), advertise_peer(Pr)]
+               end,
     #{<<"id">>         => base64:encode(Id),
       <<"host">>       => Host,
       <<"port">>       => EffPort,
       <<"query_port">> => case EffQPort of undefined -> null; P -> P end,
       <<"name">>       => Name,
+      <<"role">>       => atom_to_binary(Role, utf8),
       <<"vector">>     => base64:encode(Vec),
-      %% Include our own peer list so the remote can discover them too.
-      <<"peers">>      => [peer_to_payload(P) || P <- maps:values(Peers)]}.
+      <<"peers">>      => AdvPeers}.
+
+%% Rewrite a local leaf (host = localhost/127.0.0.1) to the hub public
+%% address with a per-agent path prefix, so remote nodes reach it through
+%% the site tunnel. Non-local or already-rewritten peers pass through.
+-spec rewrite_local(#peer{}, binary() | undefined) -> #peer{}.
+rewrite_local(P, undefined) -> P;
+rewrite_local(#peer{host = H, name = Name, base_path = <<>>, role = leaf} = P, PublicHost)
+  when H =:= <<"localhost">>; H =:= <<"127.0.0.1">> ->
+    P#peer{host       = PublicHost,
+           port       = 443,
+           query_port = 443,
+           base_path  = <<"/f/", Name/binary>>};
+rewrite_local(P, _PublicHost) -> P.
+
+%% A hub federates its own local leaves (still localhost, base_path empty)
+%% and other hubs, but never re-advertises leaves learned from another hub
+%% (those already carry a base_path). Each hub owns and advertises only its
+%% own filters, which keeps eviction authoritative and avoids re-federation.
+-spec advertise_peer(#peer{}) -> boolean().
+advertise_peer(#peer{role = hub}) -> true;
+advertise_peer(#peer{role = leaf, base_path = <<>>}) -> true;
+advertise_peer(#peer{}) -> false.
 
 %% Serialise one #peer{} record for embedding in a payload.
 -spec peer_to_payload(#peer{}) -> map().
 peer_to_payload(#peer{id = Id, host = H, port = P, query_port = QP,
-                      name = Name, vector = V, trust = T}) ->
+                      name = Name, vector = V, trust = T,
+                      base_path = BP, role = Role}) ->
     #{<<"id">>         => base64:encode(Id),
       <<"host">>       => H,
       <<"port">>       => P,
       <<"query_port">> => case QP of undefined -> null; Q -> Q end,
       <<"name">>       => Name,
       <<"vector">>     => base64:encode(V),
-      <<"trust">>      => T}.
+      <<"trust">>      => T,
+      <<"base_path">>  => BP,
+      <<"role">>       => atom_to_binary(Role, utf8)}.
 
 %% Deserialise the remote node's description from a gossip payload.
 -spec payload_to_peer(map()) -> #peer{}.
@@ -883,6 +1022,11 @@ payload_to_peer(#{<<"id">>     := Id,
         query_port = QPort,
         name       = Name,
         vector     = base64:decode(Vec),
+        base_path  = maps:get(<<"base_path">>, Map, <<>>),
+        role       = case maps:get(<<"role">>, Map, <<"hub">>) of
+                         <<"leaf">> -> leaf;
+                         _          -> hub
+                     end,
         %% Set last_seen to now — we just heard from this node.
         last_seen  = erlang:monotonic_time(millisecond)
     }.
@@ -899,7 +1043,8 @@ payload_to_peers(_) ->
 -spec peer_to_map(#peer{}) -> map().
 peer_to_map(#peer{id = Id, host = H, port = P,
                   query_port = QP, name = Name,
-                  vector = V, trust = T, last_seen = LS}) ->
+                  vector = V, trust = T, last_seen = LS,
+                  base_path = BP, role = Role}) ->
     #{id         => Id,
       host       => H,
       port       => P,
@@ -907,7 +1052,9 @@ peer_to_map(#peer{id = Id, host = H, port = P,
       name       => Name,
       vector     => V,
       trust      => T,
-      last_seen  => LS}.
+      last_seen  => LS,
+      base_path  => BP,
+      role       => Role}.
 
 %% Convert a list of #peer{} records to plain maps.
 -spec peers_to_maps([#peer{}]) -> [map()].

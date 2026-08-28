@@ -55,6 +55,10 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
+init(Req0, #{health := true} = State) ->
+    %% Unauthenticated liveness probe used by a hub to health-check its leaves.
+    {ok, cowboy_req:reply(200, #{<<"content-type">> => <<"text/plain">>},
+                          <<"ok">>, Req0), State};
 init(Req0, State) ->
     case em_filter_authz(Req0) of
         true  -> handle(Req0, State);

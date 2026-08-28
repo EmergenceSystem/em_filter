@@ -198,6 +198,8 @@ maybe_start_pop_node(AgentName, Config) ->
                 advertise_port  => maps:get(pop_advertise_port, Config, Port),
                 advertise_query_port => maps:get(pop_advertise_query_port, Config, maps:get(query_port, Config, undefined)),
                 auth_token      => maps:get(pop_auth_token, Config, undefined),
+                role            => maps:get(pop_role, Config, role_from_env()),
+                public_host     => maps:get(pop_public_host, Config, pubhost_from_env()),
                 name            => atom_to_binary(AgentName, utf8),
                 vector          => Vec,
                 seeds           => Seeds,
@@ -249,9 +251,18 @@ maybe_start_query_listener(AgentName, Config) ->
             ok;
         QPort ->
             ServerAtom = list_to_atom(atom_to_list(AgentName) ++ "_server"),
+            NameStr = atom_to_list(AgentName),
+            %% Serve both the bare path and the hub-rewritten public path
+            %% (/f/<name>/...), because the Cloudflare tunnel forwards the full
+            %% path to this origin without stripping the prefix. /health is an
+            %% unauthenticated liveness probe.
             Dispatch = cowboy_router:compile([
-                {'_', [{"/agent/query", em_filter_http,
-                        #{server => ServerAtom}}]}
+                {'_', [
+                    {"/agent/query", em_filter_http, #{server => ServerAtom}},
+                    {"/f/" ++ NameStr ++ "/agent/query", em_filter_http, #{server => ServerAtom}},
+                    {"/health", em_filter_http, #{health => true}},
+                    {"/f/" ++ NameStr ++ "/health", em_filter_http, #{health => true}}
+                ]}
             ]),
             ListenerRef = {em_filter_query, AgentName},
             case cowboy:start_clear(ListenerRef, [{port, QPort}],
@@ -433,6 +444,25 @@ parse_line(_, Acc) -> Acc.
 %%====================================================================
 %% Private helpers
 %%====================================================================
+
+%% @private
+%% @doc Node role from the EM_POP_ROLE env var (leaf|hub); default hub.
+-spec role_from_env() -> leaf | hub.
+role_from_env() ->
+    case os:getenv("EM_POP_ROLE") of
+        "leaf" -> leaf;
+        _      -> hub
+    end.
+
+%% @private
+%% @doc Public host for hub address rewriting from EM_POP_PUBLIC_HOST env.
+-spec pubhost_from_env() -> binary() | undefined.
+pubhost_from_env() ->
+    case os:getenv("EM_POP_PUBLIC_HOST") of
+        false -> undefined;
+        ""    -> undefined;
+        H     -> list_to_binary(H)
+    end.
 
 %% @private
 -spec first_ok([{ok, pid()} | {error, term()}]) ->
