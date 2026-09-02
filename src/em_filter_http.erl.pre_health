@@ -55,10 +55,6 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
-init(Req0, #{health := true} = State) ->
-    %% Unauthenticated liveness probe used by a hub to health-check its leaves.
-    {ok, cowboy_req:reply(200, #{<<"content-type">> => <<"text/plain">>},
-                          <<"ok">>, Req0), State};
 init(Req0, State) ->
     case em_filter_authz(Req0) of
         true  -> handle(Req0, State);
@@ -94,16 +90,8 @@ handle(Req0, #{server := ServerName} = State) ->
                 {ok, RawResult} ->
                     Decoded  = try json:decode(RawResult)
                                catch _:_ -> RawResult end,
-                    RespMap0 = #{<<"results">> => Decoded},
-                    RespMap  = case em_pop_crypto:sign_response(Decoded) of
-                                   {SignerId, Sig} ->
-                                       RespMap0#{<<"signer_id">> => SignerId,
-                                                 <<"signature">> => Sig};
-                                   undefined ->
-                                       RespMap0
-                               end,
                     RespBody = iolist_to_binary(
-                        json:encode(RespMap)),
+                        json:encode(#{<<"results">> => Decoded})),
                     Req2 = cowboy_req:reply(200,
                         #{<<"content-type">> => <<"application/json">>},
                         RespBody, Req1),
