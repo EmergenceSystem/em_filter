@@ -54,6 +54,7 @@
 -export([get_id/1, get_vector/1, add_peer/3, get_peers/1,
          peers_for/3, get_trust/2, gossip_tick/1, handle_gossip/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([merge_peers_from/3, test_state/1, test_peer/1, test_vector/1, has_peer/2]).
 
 %%====================================================================
 %% Constants
@@ -135,7 +136,12 @@
     dead_threshold = 3          :: pos_integer(),                     %% failed contacts before a peer is dead
     quarantine_ttl = 60000      :: pos_integer(),                    %% ms a dead peer is refused re-entry
     role = hub                  :: leaf | hub,                        %% leaf=filter (self-only), hub=disco (federates)
-    public_host = undefined     :: binary() | undefined              %% hub public host for rewriting local leaves
+    public_host = undefined     :: binary() | undefined,             %% hub public host for rewriting local leaves
+    reject_private_hosts = false :: boolean(),                       %% admission host-guard: reject blocked hosts for gossip-learned peers
+    max_peers_per_source = 0    :: non_neg_integer(),                %% reserved for future per-source rate limiting (0 = disabled)
+    root_pubkeys = []           :: [binary()],                       %% pubkeys of root-anchored hubs exempt from the host-guard
+    source_counts = #{}         :: #{binary() => non_neg_integer()}, %% reserved for future per-source rate limiting
+    ban_authority_pubkeys = []  :: [binary()]                        %% reserved for future ban-authority verification
 }).
 
 %%====================================================================
@@ -256,6 +262,10 @@ init(Opts) ->
     DeadT     = maps:get(dead_threshold,  Opts, ?DEFAULT_DEAD_THRESHOLD),
     QTtl      = maps:get(quarantine_ttl,  Opts, ?DEFAULT_QUARANTINE_TTL),
     Role0     = maps:get(role,            Opts, hub),
+    RejectPrivHosts = maps:get(reject_private_hosts, Opts, false),
+    MaxPeersPerSource = maps:get(max_peers_per_source, Opts, 0),
+    RootPubkeys = maps:get(root_pubkeys, Opts, []),
+    BanAuthPubkeys = maps:get(ban_authority_pubkeys, Opts, RootPubkeys),
     PubHost0  = case maps:get(public_host, Opts, undefined) of
                     PB when is_binary(PB) -> PB;
                     PL when is_list(PL)   -> list_to_binary(PL);
@@ -359,7 +369,12 @@ init(Opts) ->
         dead_threshold  = DeadT,
         quarantine_ttl  = QTtl,
         role            = Role0,
-        public_host     = PubHost0
+        public_host     = PubHost0,
+        reject_private_hosts = RejectPrivHosts,
+        max_peers_per_source = MaxPeersPerSource,
+        root_pubkeys    = RootPubkeys,
+        source_counts   = #{},
+        ban_authority_pubkeys = BanAuthPubkeys
     }}.
 
 %% --- Simple state accessors ---
@@ -391,7 +406,7 @@ handle_call({add_peer, Host, Port}, _From, State) ->
             Remote      = payload_to_peer(RemotePayload),
             RemotePeers = payload_to_peers(RemotePayload),
             State1 = upsert_peer(Remote, State),
-            State2 = merge_peers(RemotePeers, State1),
+            State2 = merge_peers(RemotePeers, Remote, State1),
             ?LOG_DEBUG("em_pop add_peer ok ~s:~w", [Host, Port]),
             {reply, ok, State2};
         {error, Reason} ->
@@ -450,7 +465,7 @@ handle_call(gossip_tick, _From, State) ->
             Remote      = payload_to_peer(RemotePayload),
             RemotePeers = payload_to_peers(RemotePayload),
             State1 = upsert_peer(Remote, State),
-            merge_peers(RemotePeers, State1);
+            merge_peers(RemotePeers, Remote, State1);
         {error, Reason} ->
             ?LOG_DEBUG("em_pop gossip_tick failed peer=~s reason=~p",
                        [short_id(PeerId), Reason]),
@@ -473,7 +488,7 @@ handle_call({handle_gossip, InPayload}, _From, State) ->
     Remote      = payload_to_peer(InPayload),
     RemotePeers = payload_to_peers(InPayload),
     State1 = upsert_peer(Remote, State),
-    State2 = merge_peers(RemotePeers, State1),
+    State2 = merge_peers(RemotePeers, Remote, State1),
     {reply, {ok, state_to_payload(State2)}, State2};
 
 handle_call(_Msg, _From, State) ->
@@ -555,7 +570,7 @@ handle_info({gossip_result, _PeerId, {ok, RemotePayload}}, State) ->
     Remote      = payload_to_peer(RemotePayload),
     RemotePeers = payload_to_peers(RemotePayload),
     State1 = upsert_peer(Remote, State),
-    State2 = merge_peers(RemotePeers, State1),
+    State2 = merge_peers(RemotePeers, Remote, State1),
     {noreply, State2};
 
 %% Async gossip result — failed exchange: penalise trust, keep going.
@@ -752,16 +767,16 @@ mark_failure(PeerId, #state{peers = Peers, quarantine = Q,
 %%     directly.
 %% @end
 %%--------------------------------------------------------------------
--spec merge_peers([#peer{}], #state{}) -> #state{}.
-merge_peers(_, #state{role = leaf} = State) ->
+-spec merge_peers([#peer{}], #peer{} | undefined, #state{}) -> #state{}.
+merge_peers(_, _SourcePeer, #state{role = leaf} = State) ->
     %% Leaves never build a peer table; they only talk to their hub.
     State;
-merge_peers([], State) ->
+merge_peers([], _SourcePeer, State) ->
     State;
-merge_peers([#peer{id = Id} | Rest], #state{id = Id} = State) ->
+merge_peers([#peer{id = Id} | Rest], SourcePeer, #state{id = Id} = State) ->
     %% This entry describes ourselves — skip.
-    merge_peers(Rest, State);
-merge_peers([P | Rest],
+    merge_peers(Rest, SourcePeer, State);
+merge_peers([P | Rest], SourcePeer,
             #state{peers = Peers, max_peers = Max, kvex_ix = Ix,
                    quarantine = Q} = State) ->
     Now = erlang:monotonic_time(millisecond),
@@ -776,7 +791,7 @@ merge_peers([P | Rest],
                  andalso Old#peer.base_path =:= P#peer.base_path of
                 true ->
                     %% Same address — leave it; direct contact refreshes it.
-                    merge_peers(Rest, State);
+                    merge_peers(Rest, SourcePeer, State);
                 false ->
                     %% A hub re-advertised this peer at a different (rewritten)
                     %% address; adopt it so we (and anyone we gossip) route to
@@ -788,41 +803,59 @@ merge_peers([P | Rest],
                             %% rewritten public address learned via gossip clobber
                             %% its localhost registration (that would stop us from
                             %% advertising our own leaf).
-                            merge_peers(Rest, State);
+                            merge_peers(Rest, SourcePeer, State);
                         false ->
                             Updated = Old#peer{host       = P#peer.host,
                                                port       = P#peer.port,
                                                query_port = P#peer.query_port,
                                                base_path  = P#peer.base_path,
                                                last_seen  = erlang:monotonic_time(millisecond)},
-                            merge_peers(Rest, State#state{peers = Peers#{P#peer.id => Updated}})
+                            merge_peers(Rest, SourcePeer, State#state{peers = Peers#{P#peer.id => Updated}})
                     end
             end;
         false when Quarantined ->
             %% Recently declared dead — refuse re-entry until quarantine
             %% expires. Stops a dead peer bouncing back via other gossip.
-            merge_peers(Rest, State);
+            merge_peers(Rest, SourcePeer, State);
         false when map_size(Peers) >= Max ->
             %% Peer list at capacity — stop adding more.
             ?LOG_DEBUG("em_pop max_peers=~w reached, dropping new peer", [Max]),
             State;
         false ->
-            ExpBytes = byte_size(State#state.vector),
-            case byte_size(P#peer.vector) =:= ExpBytes andalso ExpBytes > 0 of
-                false ->
-                    %% Malformed vector — skip this peer, keep merging.
-                    merge_peers(Rest, State);
+            SourceIsRoot = is_root_source(SourcePeer, State),
+            case State#state.reject_private_hosts andalso (not SourceIsRoot)
+                 andalso em_pop_netcheck:host_blocked(P#peer.host) of
                 true ->
-                    %% New peer discovered transitively — index it and add.
-                    kvex:add(Ix, P#peer.id, P#peer.vector),
-                    NewPeer = P#peer{
-                        trust     = ?TRUST_MIN,
-                        last_seen = erlang:monotonic_time(millisecond)
-                    },
-                    State1 = State#state{peers = Peers#{P#peer.id => NewPeer}},
-                    merge_peers(Rest, State1)
+                    %% Gossip-learned peer resolves to a blocked (private/
+                    %% loopback/metadata) address and the gossip source is
+                    %% not a root-anchored hub — refuse admission.
+                    merge_peers(Rest, SourcePeer, State);
+                false ->
+                    ExpBytes = byte_size(State#state.vector),
+                    case byte_size(P#peer.vector) =:= ExpBytes andalso ExpBytes > 0 of
+                        false ->
+                            %% Malformed vector — skip this peer, keep merging.
+                            merge_peers(Rest, SourcePeer, State);
+                        true ->
+                            %% New peer discovered transitively — index it and add.
+                            kvex:add(Ix, P#peer.id, P#peer.vector),
+                            NewPeer = P#peer{
+                                trust     = ?TRUST_MIN,
+                                last_seen = erlang:monotonic_time(millisecond)
+                            },
+                            State1 = State#state{peers = Peers#{P#peer.id => NewPeer}},
+                            merge_peers(Rest, SourcePeer, State1)
+                    end
             end
     end.
+
+%% @doc True when SourcePeer advertises a pubkey listed in State's
+%% root_pubkeys — such a source is exempt from the admission host-guard.
+-spec is_root_source(#peer{} | undefined, #state{}) -> boolean().
+is_root_source(#peer{pubkey = Pk}, #state{root_pubkeys = Roots}) when is_binary(Pk) ->
+    lists:member(Pk, Roots);
+is_root_source(_, _) ->
+    false.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -1149,3 +1182,72 @@ short_id(Id) when byte_size(Id) >= 4 ->
     binary:encode_hex(Short, lowercase);
 short_id(Id) ->
     binary:encode_hex(Id, lowercase).
+
+%%====================================================================
+%% Test-only helpers (exported for eunit)
+%%====================================================================
+
+%% @doc Build a minimal hub-role #state{} for eunit tests. ConfigOpts is
+%% merged over the admission host-guard config defaults; nothing else in
+%% the state is configurable through this helper.
+-spec test_state(map()) -> #state{}.
+test_state(ConfigOpts) ->
+    Vec = em_filter_vec:from_capabilities([<<"test">>]),
+    Dim = byte_size(Vec) div 4,
+    {ok, Ix} = kvex:new(Dim),
+    Defaults = #{
+        reject_private_hosts => false,
+        max_peers_per_source => 0,
+        root_pubkeys => [],
+        source_counts => #{},
+        ban_authority_pubkeys => []
+    },
+    Cfg = maps:merge(Defaults, ConfigOpts),
+    #state{
+        id                    = <<0:128>>,
+        port                  = 0,
+        vector                = Vec,
+        peers                 = #{},
+        kvex_ix               = Ix,
+        stale_timeout         = 30_000,
+        gossip_interval       = 0,
+        max_peers             = 1000,
+        role                  = hub,
+        reject_private_hosts  = maps:get(reject_private_hosts, Cfg),
+        max_peers_per_source  = maps:get(max_peers_per_source, Cfg),
+        root_pubkeys          = maps:get(root_pubkeys, Cfg),
+        source_counts         = maps:get(source_counts, Cfg),
+        ban_authority_pubkeys = maps:get(ban_authority_pubkeys, Cfg)
+    }.
+
+%% @doc Build a #peer{} record from a map for eunit tests. Unspecified
+%% fields fall back to innocuous defaults; `vector' defaults to
+%% `undefined' when not supplied (tests that exercise the new-peer path
+%% pass it explicitly via test_vector/1 so lengths match the state).
+-spec test_peer(map()) -> #peer{}.
+test_peer(Opts) ->
+    #peer{
+        id         = maps:get(id, Opts),
+        host       = maps:get(host, Opts),
+        port       = maps:get(port, Opts, 0),
+        query_port = maps:get(query_port, Opts, undefined),
+        name       = maps:get(name, Opts, <<>>),
+        vector     = maps:get(vector, Opts, undefined),
+        trust      = maps:get(trust, Opts, 0.0),
+        last_seen  = maps:get(last_seen, Opts, erlang:monotonic_time(millisecond)),
+        role       = maps:get(role, Opts, hub),
+        pubkey     = maps:get(pubkey, Opts, undefined)
+    }.
+
+%% @doc Return State's capability vector — eunit convenience for building
+%% peers whose vector must match the state's dimension.
+-spec test_vector(#state{}) -> binary().
+test_vector(#state{vector = V}) -> V.
+
+%% @doc True when State has a peer with the given Id — eunit helper.
+-spec has_peer(#state{}, binary()) -> boolean().
+has_peer(#state{peers = P}, Id) -> maps:is_key(Id, P).
+
+%% @doc Test-only entry point exposing merge_peers/3 to eunit.
+-spec merge_peers_from([#peer{}], #peer{} | undefined, #state{}) -> #state{}.
+merge_peers_from(Peers, Src, State) -> merge_peers(Peers, Src, State).
