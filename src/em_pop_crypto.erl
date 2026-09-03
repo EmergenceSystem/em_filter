@@ -7,7 +7,8 @@
 -module(em_pop_crypto).
 -export([keypair/0, id_of/1, sign/2, verify/3,
          canonical_identity/1, canonical_response/1, verify_selfsig/1,
-         load_or_create/1, pubkey/0, privkey/0, node_id/0, sign_response/1]).
+         load_or_create/1, pubkey/0, privkey/0, node_id/0, sign_response/1,
+         canonical_ban/2]).
 
 -define(PT_KEY, {em_pop_crypto, keypair}).
 
@@ -25,13 +26,13 @@ verify(Msg, Sig, Pub) ->
     try crypto:verify(eddsa, none, Msg, Sig, [Pub, ed25519]) catch _:_ -> false end.
 
 -spec canonical_identity(map()) -> binary().
+%% STABLE identity only (id + name): hubs rewrite a leaf's host/port before
+%% relaying, so signing those would break the self-signature. id=hash(pubkey)
+%% already binds the key to the id. MUST stay byte-identical to Emquest's copy.
 canonical_identity(M) ->
     Id   = to_bin(maps:get(id, M, <<>>)),
-    Host = to_bin(maps:get(host, M, <<>>)),
-    Port = integer_to_binary(maps:get(port, M, 0)),
-    QP   = integer_to_binary(qp(maps:get(query_port, M, 0))),
     Name = to_bin(maps:get(name, M, <<>>)),
-    iolist_to_binary([Id, 0, Host, 0, Port, 0, QP, 0, Name]).
+    iolist_to_binary([Id, 0, Name]).
 
 %% @doc Deterministic bytes over a response's item list. Covers the rendered
 %% fields (url, title/label, resume/value/description) in list order. No JSON
@@ -104,3 +105,10 @@ qp(undefined) -> 0; qp(N) when is_integer(N) -> N; qp(_) -> 0.
 to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L) -> iolist_to_binary(L);
 to_bin(_) -> <<>>.
+
+%% @doc Deterministic bytes for a ban record. MUST stay byte-identical across
+%% both repos (em_filter_src and Emquest) so a signature made by one verifies
+%% in the other.
+-spec canonical_ban(binary(), integer()) -> binary().
+canonical_ban(BannedId, Ts) when is_binary(BannedId), is_integer(Ts) ->
+    iolist_to_binary([BannedId, 0, integer_to_binary(Ts)]).

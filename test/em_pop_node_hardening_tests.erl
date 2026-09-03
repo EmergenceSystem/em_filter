@@ -61,3 +61,15 @@ sybil_root_source_unlimited_test() ->
              query_port => 9200+N, vector => em_pop_node:test_vector(S0)}) || N <- [1,2,3,4]],
     S1 = em_pop_node:merge_peers_from(Ps, Src, S0),
     ?assertEqual(4, length([1 || N <- [1,2,3,4], em_pop_node:has_peer(S1, <<N:128>>)])).
+
+canonical_ban_stable_test() ->
+    B = em_pop_crypto:canonical_ban(<<1:128>>, 1234567890),
+    ?assert(is_binary(B)),
+    ?assertEqual(B, em_pop_crypto:canonical_ban(<<1:128>>, 1234567890)).
+
+ban_sign_verify_roundtrip_test() ->
+    {Pub, Priv} = em_pop_crypto:keypair(),
+    Rec = em_pop_crypto:canonical_ban(<<1:128>>, 1234567890),
+    Sig = em_pop_crypto:sign(Rec, Priv),
+    ?assert(em_pop_crypto:verify(Rec, Sig, Pub)),
+    ?assertNot(em_pop_crypto:verify(em_pop_crypto:canonical_ban(<<1:128>>, 9), Sig, Pub)).
