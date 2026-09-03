@@ -43,3 +43,21 @@ host_guard_off_keeps_private_test() ->
     Src = em_pop_node:test_peer(#{id => <<9:128>>, host => <<"evil.example">>, pubkey => <<2:256>>}),
     S1 = em_pop_node:merge_peers_from([P], Src, S0),
     ?assert(em_pop_node:has_peer(S1, <<1:128>>)).
+
+sybil_caps_nonroot_source_test() ->
+    S0 = em_pop_node:test_state(#{max_peers_per_source => 2, root_pubkeys => []}),
+    Src = em_pop_node:test_peer(#{id => <<9:128>>, host => <<"h.example">>, pubkey => <<2:256>>}),
+    Ps = [em_pop_node:test_peer(#{id => <<N:128>>, host => <<"93.184.216.34">>,
+             query_port => 9200+N, vector => em_pop_node:test_vector(S0)}) || N <- [1,2,3,4]],
+    S1 = em_pop_node:merge_peers_from(Ps, Src, S0),
+    Kept = length([1 || N <- [1,2,3,4], em_pop_node:has_peer(S1, <<N:128>>)]),
+    ?assertEqual(2, Kept).
+
+sybil_root_source_unlimited_test() ->
+    Root = <<7:256>>,
+    S0 = em_pop_node:test_state(#{max_peers_per_source => 2, root_pubkeys => [Root]}),
+    Src = em_pop_node:test_peer(#{id => <<9:128>>, host => <<"r.example">>, pubkey => Root}),
+    Ps = [em_pop_node:test_peer(#{id => <<N:128>>, host => <<"93.184.216.34">>,
+             query_port => 9200+N, vector => em_pop_node:test_vector(S0)}) || N <- [1,2,3,4]],
+    S1 = em_pop_node:merge_peers_from(Ps, Src, S0),
+    ?assertEqual(4, length([1 || N <- [1,2,3,4], em_pop_node:has_peer(S1, <<N:128>>)])).

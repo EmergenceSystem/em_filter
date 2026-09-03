@@ -837,14 +837,33 @@ merge_peers([P | Rest], SourcePeer,
                             %% Malformed vector — skip this peer, keep merging.
                             merge_peers(Rest, SourcePeer, State);
                         true ->
-                            %% New peer discovered transitively — index it and add.
-                            kvex:add(Ix, P#peer.id, P#peer.vector),
-                            NewPeer = P#peer{
-                                trust     = ?TRUST_MIN,
-                                last_seen = erlang:monotonic_time(millisecond)
-                            },
-                            State1 = State#state{peers = Peers#{P#peer.id => NewPeer}},
-                            merge_peers(Rest, SourcePeer, State1)
+                            %% New peer discovered transitively — index it and
+                            %% add, subject to the per-source sybil cap.
+                            SrcId = case SourcePeer of #peer{id = SI} -> SI; _ -> undefined end,
+                            Cap   = State#state.max_peers_per_source,
+                            Count = case is_binary(SrcId) of
+                                        true  -> maps:get(SrcId, State#state.source_counts, 0);
+                                        false -> 0
+                                    end,
+                            case (not SourceIsRoot) andalso Cap > 0 andalso Count >= Cap of
+                                true ->
+                                    %% Non-root source already introduced Cap
+                                    %% distinct peers — drop this one.
+                                    merge_peers(Rest, SourcePeer, State);
+                                false ->
+                                    kvex:add(Ix, P#peer.id, P#peer.vector),
+                                    NewPeer = P#peer{
+                                        trust     = ?TRUST_MIN,
+                                        last_seen = erlang:monotonic_time(millisecond)
+                                    },
+                                    SC = case (not SourceIsRoot) andalso is_binary(SrcId) of
+                                             true  -> maps:put(SrcId, Count + 1, State#state.source_counts);
+                                             false -> State#state.source_counts
+                                         end,
+                                    State1 = State#state{peers = Peers#{P#peer.id => NewPeer},
+                                                         source_counts = SC},
+                                    merge_peers(Rest, SourcePeer, State1)
+                            end
                     end
             end
     end.
