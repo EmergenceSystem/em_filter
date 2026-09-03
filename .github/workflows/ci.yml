@@ -81,12 +81,10 @@ jobs:
             echo "::notice::no version change ('$cur'); skipping publish"
             exit 0
           fi
-          # Version changed in this commit. Guard against re-publishing a version
-          # that is already on hex (e.g. history reconciliation, re-runs).
           code=$(curl -s -o /dev/null -w '%{http_code}' "https://hex.pm/api/packages/em_filter/releases/$cur")
           if [ "$code" = "200" ]; then
             echo "bumped=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::version $cur is already published on hex; skipping publish"
+            echo "::warning::em_filter $cur already published on hex; skipping"
           else
             echo "bumped=true" >> "$GITHUB_OUTPUT"
             echo "::notice::em_filter version bump detected: '$prev' -> '$cur'"
@@ -95,28 +93,35 @@ jobs:
       - uses: erlef/setup-beam@v1
         if: steps.ver.outputs.bumped == 'true'
         with:
-          otp-version: ${{ env.OTP_VERSION }}
+          otp-version: '27'   # rebar3_hex is happiest on <=27
           rebar3-version: ${{ env.REBAR3_VERSION }}
 
-      - name: Install NIF build toolchain
+      # sied's own rebar.config ships no rebar3_hex plugin; enable it globally
+      # (runner-only, never in the package). Harmless for em_filter too.
+      - name: Enable rebar3_hex (global, not shipped)
         if: steps.ver.outputs.bumped == 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          mkdir -p ~/.config/rebar3
+          echo '{plugins, [{rebar3_hex, "7.0.6"}]}.' > ~/.config/rebar3/rebar.config
+
+      # rebar3_hex 7.0.6 does NOT read HEX_API_KEY on the publish/write path
+      # (only merge_with_env, which publish bypasses). Write the api_key straight
+      # into the hex auth config so hex_config_write uses it directly (no local
+      # password). The key MUST have api write permission.
+      - name: Configure hex auth
+        if: steps.ver.outputs.bumped == 'true'
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          printf '#{<<"hexpm">> => #{api_key => <<"%s">>}}.\n' "$HEX_API_KEY" > ~/.config/rebar3/hex.config
 
       - name: Publish dry-run
         if: steps.ver.outputs.bumped == 'true'
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-        run: rebar3 hex publish --dry-run
+        run: rebar3 hex publish package --dry-run
 
       - name: Publish to hex
         if: steps.ver.outputs.bumped == 'true'
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-        run: rebar3 hex publish --yes
+        run: rebar3 hex publish package --yes
 
       - name: Tag release
         if: steps.ver.outputs.bumped == 'true'
@@ -126,12 +131,6 @@ jobs:
           git tag "v${{ steps.ver.outputs.version }}"
           git push origin "v${{ steps.ver.outputs.version }}"
 
-  # ---------------------------------------------------------------------------
-  # After a successful publish: open a bump PR in every EmergenceSystem
-  # *_filter repo that depends on em_filter and is not already on the new
-  # version. Requires an org-scoped PAT (secrets.ORG_PAT) because the default
-  # GITHUB_TOKEN cannot write to other repositories.
-  # ---------------------------------------------------------------------------
   downstream:
     needs: publish
     if: needs.publish.outputs.bumped == 'true'
