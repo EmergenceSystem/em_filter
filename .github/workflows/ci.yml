@@ -67,27 +67,22 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2   # need HEAD^ to diff the version
 
       - id: ver
-        name: Detect version bump
+        name: Detect publishable version
         run: |
           cur=$(grep -oP '\{vsn,\s*"\K[0-9.]+' src/em_filter.app.src | head -1)
-          prev=$(git show HEAD^:src/em_filter.app.src 2>/dev/null | grep -oP '\{vsn,\s*"\K[0-9.]+' | head -1 || true)
           echo "version=$cur" >> "$GITHUB_OUTPUT"
-          if [ -z "$cur" ] || [ "$cur" = "$prev" ]; then
-            echo "bumped=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::no version change ('$cur'); skipping publish"
-            exit 0
+          if [ -z "$cur" ]; then
+            echo "bumped=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           code=$(curl -s -o /dev/null -w '%{http_code}' "https://hex.pm/api/packages/em_filter/releases/$cur")
           if [ "$code" = "200" ]; then
             echo "bumped=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::em_filter $cur already published on hex; skipping"
+            echo "::notice::em_filter $cur already on hex; nothing to publish"
           else
             echo "bumped=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::em_filter version bump detected: '$prev' -> '$cur'"
+            echo "::notice::em_filter $cur not on hex; publishing"
           fi
 
       - uses: erlef/setup-beam@v1
@@ -115,10 +110,6 @@ jobs:
         run: |
           printf '#{<<"hexpm">> => #{api_key => <<"%s">>}}.\n' "$HEX_API_KEY" > ~/.config/rebar3/hex.config
 
-      - name: Publish dry-run
-        if: steps.ver.outputs.bumped == 'true'
-        run: rebar3 hex publish package --dry-run
-
       - name: Publish to hex
         if: steps.ver.outputs.bumped == 'true'
         run: rebar3 hex publish package --yes
@@ -128,8 +119,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v${{ steps.ver.outputs.version }}"
-          git push origin "v${{ steps.ver.outputs.version }}"
+          git tag "v${{ steps.ver.outputs.version }}" || exit 0
+          git push origin "v${{ steps.ver.outputs.version }}" || true
 
   downstream:
     needs: publish
