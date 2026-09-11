@@ -125,3 +125,39 @@ shared_relay_bans_in_payload_test() ->
     S1 = em_pop_node:apply_bans_from([Ban], S0),
     Payload = em_pop_node:state_payload_for_test(S1),
     ?assertEqual(1, length(maps:get(<<"bans">>, Payload, []))).
+
+shared_signed_unban_clears_ban_test() ->
+    {Pub, Priv} = em_pop_crypto:keypair(),
+    S0 = em_pop_node:test_state(#{ban_authority_pubkeys => [Pub]}),
+    S1 = em_pop_node:test_add_peer(S0, <<1:128>>, <<"93.184.216.34">>),
+    BanTs = 100,
+    BSig = em_pop_crypto:sign(em_pop_crypto:canonical_ban(<<1:128>>, BanTs), Priv),
+    Ban = #{<<"id">> => base64:encode(<<1:128>>), <<"ts">> => BanTs,
+            <<"sig">> => base64:encode(BSig), <<"signer">> => base64:encode(Pub)},
+    S2 = em_pop_node:apply_bans_from([Ban], S1),
+    ?assert(em_pop_node:is_banned_st(S2, <<1:128>>)),
+    UnbanTs = 200,
+    USig = em_pop_crypto:sign(em_pop_crypto:canonical_unban(<<1:128>>, UnbanTs), Priv),
+    Unban = #{<<"id">> => base64:encode(<<1:128>>), <<"ts">> => UnbanTs,
+             <<"sig">> => base64:encode(USig), <<"signer">> => base64:encode(Pub)},
+    S3 = em_pop_node:apply_unbans_from([Unban], S2),
+    ?assertNot(em_pop_node:is_banned_st(S3, <<1:128>>)),
+    S4 = em_pop_node:apply_bans_from([Ban], S3),
+    ?assertNot(em_pop_node:is_banned_st(S4, <<1:128>>)).
+
+shared_ignore_forged_unban_test() ->
+    {Auth, APriv} = em_pop_crypto:keypair(),
+    {_Bad, BadPriv} = em_pop_crypto:keypair(),
+    S0 = em_pop_node:test_state(#{ban_authority_pubkeys => [Auth]}),
+    BanTs = 100,
+    BSig = em_pop_crypto:sign(em_pop_crypto:canonical_ban(<<1:128>>, BanTs), APriv),
+    Ban = #{<<"id">> => base64:encode(<<1:128>>), <<"ts">> => BanTs,
+            <<"sig">> => base64:encode(BSig), <<"signer">> => base64:encode(Auth)},
+    S1 = em_pop_node:apply_bans_from([Ban], S0),
+    ?assert(em_pop_node:is_banned_st(S1, <<1:128>>)),
+    FTs = 200,
+    FSig = em_pop_crypto:sign(em_pop_crypto:canonical_unban(<<1:128>>, FTs), BadPriv),
+    Forged = #{<<"id">> => base64:encode(<<1:128>>), <<"ts">> => FTs,
+              <<"sig">> => base64:encode(FSig), <<"signer">> => base64:encode(Auth)},
+    S2 = em_pop_node:apply_unbans_from([Forged], S1),
+    ?assert(em_pop_node:is_banned_st(S2, <<1:128>>)).

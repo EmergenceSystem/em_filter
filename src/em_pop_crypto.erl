@@ -8,7 +8,7 @@
 -export([keypair/0, id_of/1, sign/2, verify/3,
          canonical_identity/1, canonical_response/1, verify_selfsig/1,
          load_or_create/1, pubkey/0, privkey/0, node_id/0, sign_response/1,
-         canonical_ban/2]).
+         canonical_ban/2, canonical_unban/2]).
 
 -define(PT_KEY, {em_pop_crypto, keypair}).
 
@@ -112,3 +112,7 @@ to_bin(_) -> <<>>.
 -spec canonical_ban(binary(), integer()) -> binary().
 canonical_ban(BannedId, Ts) when is_binary(BannedId), is_integer(Ts) ->
     iolist_to_binary([BannedId, 0, integer_to_binary(Ts)]).
+
+-spec canonical_unban(binary(), integer()) -> binary().
+canonical_unban(BannedId, Ts) when is_binary(BannedId), is_integer(Ts) ->
+    iolist_to_binary([BannedId, 1, integer_to_binary(Ts)]).
