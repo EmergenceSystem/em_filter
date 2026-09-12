@@ -89,6 +89,7 @@ start_agent(AgentName, HandlerModule, Config) ->
     end, IndexedNodes),
     _ = maybe_start_pop_node(AgentName, Config),
     _ = maybe_start_query_listener(AgentName, Config),
+    _ = maybe_start_mcp_listener(AgentName, Config),
     first_ok(Results).
 
 %%--------------------------------------------------------------------
@@ -125,6 +126,7 @@ stop_agent(AgentName) ->
             end, Ids),
             em_pop_sup:stop_node(AgentName),
             catch cowboy:stop_listener({em_filter_query, AgentName}),
+            catch cowboy:stop_listener({em_filter_mcp, AgentName}),
             ok
     end.
 
@@ -274,6 +276,59 @@ maybe_start_query_listener(AgentName, Config) ->
                     ok;
                 {error, Reason} ->
                     logger:warning("[em_filter] query listener failed to start",
+                                   #{agent => AgentName, reason => Reason})
+            end,
+            ok
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Optionally start a Cowboy HTTP listener exposing this agent as
+%% an MCP (Model Context Protocol) server.
+%%
+%% Only starts when Config contains an `mcp_port' key. The agent's own
+%% `handle/2' is exposed as a single MCP tool named after AgentName —
+%% this lets the agent be plugged directly into an MCP client (Claude,
+%% Cursor, VS Code…) without going through em_disco at all. Independent
+%% of `query_port': an agent can enable MCP without also exposing the
+%% raw `/agent/query' HTTP surface, or vice versa.
+%%
+%% Route:  POST/GET /mcp → em_filter_mcp_handler
+%%         #{server => ServerAtom, name => AgentName, capabilities => Caps}
+%%
+%% `already_started' is accepted silently so `start_agent/3' may be
+%% called again after a partial failure without crashing. All other
+%% errors are logged but do not abort agent startup.
+%% @end
+%%--------------------------------------------------------------------
+-spec maybe_start_mcp_listener(atom(), map()) -> ok.
+maybe_start_mcp_listener(AgentName, Config) ->
+    case maps:get(mcp_port, Config, undefined) of
+        undefined ->
+            ok;
+        McpPort ->
+            ServerAtom = list_to_atom(atom_to_list(AgentName) ++ "_server"),
+            NameStr  = atom_to_list(AgentName),
+            NameBin  = atom_to_binary(AgentName, utf8),
+            Caps     = maps:get(capabilities, Config, []),
+            McpState = #{server => ServerAtom, name => NameBin,
+                         capabilities => Caps},
+            Dispatch = cowboy_router:compile([
+                {'_', [
+                    {"/mcp", em_filter_mcp_handler, McpState},
+                    {"/f/" ++ NameStr ++ "/mcp", em_filter_mcp_handler, McpState}
+                ]}
+            ]),
+            ListenerRef = {em_filter_mcp, AgentName},
+            case cowboy:start_clear(ListenerRef, [{port, McpPort}],
+                                    #{env => #{dispatch => Dispatch}}) of
+                {ok, _} ->
+                    logger:info("[em_filter] mcp listener on port ~w for ~p",
+                                [McpPort, AgentName]);
+                {error, {already_started, _}} ->
+                    ok;
+                {error, Reason} ->
+                    logger:warning("[em_filter] mcp listener failed to start",
                                    #{agent => AgentName, reason => Reason})
             end,
             ok

@@ -18,6 +18,7 @@
         em_filter_sup,
         em_filter_server,
         em_filter_http,
+        em_filter_mcp_handler,
         em_filter_vec,
         em_pop_sup,
         em_pop_node,
