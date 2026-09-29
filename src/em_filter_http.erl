@@ -94,16 +94,16 @@ handle(Req0, #{server := ServerName} = State) ->
                 {ok, RawResult} ->
                     Decoded  = try json:decode(RawResult)
                                catch _:_ -> RawResult end,
-                    RespMap0 = #{<<"results">> => Decoded},
-                    RespMap  = case em_pop_crypto:sign_response(Decoded) of
+                    Ts       = erlang:system_time(millisecond),
+                    RespMap0 = #{<<"results">> => Decoded, <<"ts">> => Ts},
+                    RespMap  = case em_pop_crypto:sign_response_v2(Query, Ts, Decoded) of
                                    {SignerId, Sig} ->
                                        RespMap0#{<<"signer_id">> => SignerId,
                                                  <<"signature">> => Sig};
                                    undefined ->
                                        RespMap0
                                end,
-                    RespBody = iolist_to_binary(
-                        json:encode(RespMap)),
+                    RespBody = iolist_to_binary(json:encode(RespMap)),
                     Req2 = cowboy_req:reply(200,
                         #{<<"content-type">> => <<"application/json">>},
                         RespBody, Req1),

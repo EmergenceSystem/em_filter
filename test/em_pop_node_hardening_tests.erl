@@ -161,3 +161,11 @@ shared_ignore_forged_unban_test() ->
               <<"sig">> => base64:encode(FSig), <<"signer">> => base64:encode(Auth)},
     S2 = em_pop_node:apply_unbans_from([Forged], S1),
     ?assert(em_pop_node:is_banned_st(S2, <<1:128>>)).
+
+peer_to_payload_omits_trust_test() ->
+    P = em_pop_node:test_peer(#{id => <<"id0">>, host => <<"h">>, port => 1,
+                                query_port => 2, name => <<"n">>,
+                                vector => <<0,0,0,0>>, trust => 0.7}),
+    Map = em_pop_node:peer_to_payload_for_test(P),
+    ?assertEqual(error, maps:find(<<"trust">>, Map)),
+    ?assertEqual(<<"h">>, maps:get(<<"host">>, Map)).

@@ -51,12 +51,16 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([start_link/1]).
+-export([sig_headers/1]).
 -export([get_id/1, get_vector/1, add_peer/3, get_peers/1,
          peers_for/3, get_trust/2, gossip_tick/1, handle_gossip/2,
          add_relay_peer/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -export([merge_peers_from/3, test_state/1, test_peer/1, test_vector/1, has_peer/2]).
 -export([apply_bans_from/2, apply_unbans_from/2, test_add_peer/3, is_banned_st/2, state_payload_for_test/1]).
+-ifdef(TEST).
+-export([peer_to_payload_for_test/1]).
+-endif.
 
 %%====================================================================
 %% Constants
@@ -1144,10 +1148,7 @@ start_gossip_profile() ->
 
 http_post(Url, Payload) ->
     Body = iolist_to_binary(json:encode(Payload)),
-    Hdrs = case application:get_env(em_filter, auth_token, undefined) of
-               undefined -> [];
-               Tok -> [{"authorization", "Bearer " ++ binary_to_list(Tok)}]
-           end,
+    Hdrs = sig_headers(Body) ++ bearer_headers(),
     Req  = {Url, Hdrs, "application/json", Body},
     Opts = [{timeout, ?GOSSIP_HTTP_TIMEOUT}],
     case httpc:request(post, Req, Opts, [{body_format, binary}], em_pop) of
@@ -1159,6 +1160,29 @@ http_post(Url, Payload) ->
             {error, {http_error, Code}};
         {error, Reason} ->
             {error, Reason}
+    end.
+
+bearer_headers() ->
+    case application:get_env(em_filter, auth_token, undefined) of
+        undefined -> [];
+        Tok -> [{"authorization", "Bearer " ++ binary_to_list(Tok)}]
+    end.
+
+%% @doc Sign the gossip request body with the node key (empty when no key
+%% is loaded -- the ingress then falls back to the bearer while signed
+%% gossip is optional). Exported for unit testing.
+-spec sig_headers(binary()) -> [{string(), string()}].
+sig_headers(Body) ->
+    case {em_pop_crypto:pubkey(), em_pop_crypto:privkey()} of
+        {Pub, Priv} when is_binary(Pub), is_binary(Priv) ->
+            Id  = em_pop_crypto:id_of(Pub),
+            Ts  = erlang:system_time(millisecond),
+            Sig = em_pop_crypto:sign(
+                    em_pop_crypto:canonical_gossip_auth(Id, Ts, crypto:hash(sha256, Body)), Priv),
+            [{"x-pop-id",  binary_to_list(base64:encode(Id))},
+             {"x-pop-ts",  integer_to_list(Ts)},
+             {"x-pop-sig", binary_to_list(base64:encode(Sig))}];
+        _ -> []
     end.
 
 %%====================================================================
@@ -1244,7 +1268,7 @@ advertise_peer(#peer{}) -> false.
 %% Serialise one #peer{} record for embedding in a payload.
 -spec peer_to_payload(#peer{}) -> map().
 peer_to_payload(#peer{id = Id, host = H, port = P, query_port = QP,
-                      name = Name, vector = V, trust = T,
+                      name = Name, vector = V, trust = _,
                       base_path = BP, role = Role,
                       pubkey = Pubkey, selfsig = Selfsig, relay_via = RelayVia}) ->
     #{<<"id">>         => base64:encode(Id),
@@ -1253,7 +1277,6 @@ peer_to_payload(#peer{id = Id, host = H, port = P, query_port = QP,
       <<"query_port">> => case QP of undefined -> null; Q -> Q end,
       <<"name">>       => Name,
       <<"vector">>     => base64:encode(V),
-      <<"trust">>      => T,
       <<"base_path">>  => BP,
       <<"role">>       => atom_to_binary(Role, utf8),
       <<"pubkey">>     => case Pubkey of undefined -> null; PK -> base64:encode(PK) end,
@@ -1461,3 +1484,8 @@ is_banned_logic(Banned, Unbans, Id) ->
 %% @doc Test-only entry point exposing state_to_payload/1 to eunit.
 -spec state_payload_for_test(#state{}) -> map().
 state_payload_for_test(State) -> state_to_payload(State).
+
+-ifdef(TEST).
+%% @doc Test-only entry point exposing peer_to_payload/1 to eunit.
+peer_to_payload_for_test(P) -> peer_to_payload(P).
+-endif.

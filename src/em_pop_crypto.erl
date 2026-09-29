@@ -8,6 +8,7 @@
 -export([keypair/0, id_of/1, sign/2, verify/3,
          canonical_identity/1, canonical_response/1, verify_selfsig/1,
          load_or_create/1, pubkey/0, privkey/0, node_id/0, sign_response/1,
+         canonical_response_v2/3, sign_response_v2/3, canonical_gossip_auth/3,
          canonical_ban/2, canonical_unban/2]).
 
 -define(PT_KEY, {em_pop_crypto, keypair}).
@@ -42,6 +43,21 @@ canonical_response(Items) when is_list(Items) ->
     iolist_to_binary([item_line(I) || I <- Items]);
 canonical_response(_) -> <<>>.
 
+%% @doc v2 signing bytes: binds the signature to the query answered and a
+%% signing timestamp (ms), closing cross-query replay. Layout:
+%% Query 0 Ts(decimal) 0 canonical_response(Items). MUST stay byte-identical
+%% across both repos (em_filter_src and Emquest); guarded by a fixture test.
+-spec canonical_response_v2(binary(), integer(), list()) -> binary().
+canonical_response_v2(Query, Ts, Items) when is_integer(Ts), is_list(Items) ->
+    iolist_to_binary([to_bin(Query), 0, integer_to_binary(Ts), 0,
+                      canonical_response(Items)]);
+canonical_response_v2(_, _, _) -> <<>>.
+
+-spec canonical_gossip_auth(binary(), integer(), binary()) -> binary().
+canonical_gossip_auth(Id, Ts, BodyHash) when is_integer(Ts), is_binary(BodyHash) ->
+    iolist_to_binary([to_bin(Id), 0, integer_to_binary(Ts), 0, BodyHash]);
+canonical_gossip_auth(_, _, _) -> <<>>.
+
 item_line(I) when is_map(I) ->
     P = case maps:get(<<"properties">>, I, undefined) of
             M when is_map(M) -> M; _ -> I
@@ -72,11 +88,16 @@ load_or_create(Dir) ->
     File = filename:join(Dir, "node_ed25519.key"),
     KP = case file:read_file(File) of
              {ok, <<Pub:32/binary, Priv:32/binary>>} -> {Pub, Priv};
-             _ ->
+             {error, enoent} ->
                  {Pub0, Priv0} = keypair(),
                  ok = filelib:ensure_dir(File),
                  ok = file:write_file(File, <<Pub0/binary, Priv0/binary>>),
-                 {Pub0, Priv0}
+                 _  = file:change_mode(File, 8#600),
+                 {Pub0, Priv0};
+             {ok, Other} ->
+                 error({bad_node_key, File, byte_size(Other)});
+             {error, Reason} ->
+                 error({node_key_read_failed, File, Reason})
          end,
     persistent_term:put(?PT_KEY, KP),
     KP.
@@ -97,6 +118,17 @@ sign_response(Items) ->
     case persistent_term:get(?PT_KEY, undefined) of
         {Pub, Priv} ->
             Sig = sign(canonical_response(Items), Priv),
+            {base64:encode(id_of(Pub)), base64:encode(Sig)};
+        _ -> undefined
+    end.
+
+%% @doc Sign query+timestamp-bound response bytes (v2). Returns
+%% {SignerIdBase64, SigBase64} or undefined when no keypair is loaded.
+-spec sign_response_v2(binary(), integer(), list()) -> {binary(), binary()} | undefined.
+sign_response_v2(Query, Ts, Items) ->
+    case persistent_term:get(?PT_KEY, undefined) of
+        {Pub, Priv} ->
+            Sig = sign(canonical_response_v2(Query, Ts, Items), Priv),
             {base64:encode(id_of(Pub)), base64:encode(Sig)};
         _ -> undefined
     end.
