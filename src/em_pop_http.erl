@@ -45,7 +45,7 @@
 %%   `rate_limit => {Mod, Fun, Capacity, WindowSeconds}' — checked before
 %%     authz; `Mod:Fun(ClientKey, Capacity, WindowSeconds)' must return a
 %%     boolean, false yields HTTP 429.
-%%   `rate_key_prefix => Bin' — prepended to the client key (default <<>>) so
+%%   `rate_key_prefix => Bin' — prepended to the client key (default empty) so
 %%     this route gets its own bucket in a shared limiter table.
 %%   `max_body => Bytes' — larger request bodies yield HTTP 413.
 %%   `max_peers => N' — payloads embedding more than N peers yield 413.
